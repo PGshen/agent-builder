@@ -8,11 +8,11 @@
 
 | ID | 任务 | 状态 | 备注 |
 |---|---|---|---|
-| T0.1 | Docker Compose 基础设施（Postgres/Redis/MinIO） | 已完成 | 详见 [HANDOFF.md](./HANDOFF.md) |
-| T0.2 | Backend API 项目骨架（FastAPI） | 已完成 | 详见 [HANDOFF.md](./HANDOFF.md) |
-| T0.3 | Agent Runner 项目骨架 | 已完成 | 详见 [HANDOFF.md](./HANDOFF.md) |
-| T0.4 | 前端项目骨架（TypeScript） | 已完成 | 包管理器改为 pnpm，UI 改用 shadcn/ui，详见 [HANDOFF.md](./HANDOFF.md) |
-| T0.5 | 简单登录鉴权 | 已完成 | 详见 [HANDOFF.md](./HANDOFF.md) |
+| T0.1 | Docker Compose 基础设施（Postgres/Redis/MinIO） | 已完成 | 详见 [归档记录](./handoff-archive/phase0-2026-08-29.md) |
+| T0.2 | Backend API 项目骨架（FastAPI） | 已完成 | 详见 [归档记录](./handoff-archive/phase0-2026-08-29.md) |
+| T0.3 | Agent Runner 项目骨架 | 已完成 | 详见 [归档记录](./handoff-archive/phase0-2026-08-29.md) |
+| T0.4 | 前端项目骨架（TypeScript） | 已完成 | 包管理器改为 pnpm，UI 改用 shadcn/ui，详见 [归档记录](./handoff-archive/phase0-2026-08-29.md) |
+| T0.5 | 简单登录鉴权 | 已完成 | 详见 [归档记录](./handoff-archive/phase0-2026-08-29.md) |
 
 ## Phase 1：元数据管理（Skill / MCP）
 
