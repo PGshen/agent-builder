@@ -165,6 +165,17 @@
 - 上传不符合规范（缺 `SKILL.md` 等）的内容时，接口能明确拒绝并返回原因
 - 删除 Skill 后，MinIO 对象与 Postgres 元数据一并清理
 
+**决策记录**（实现时落地）：
+- 创建接口（`POST /skills`）与编辑/保存接口（`PUT /skills/{id}`）用了两种不同的输入形式，均对应 TASKS 原文语义：创建接口接收 `multipart/form-data`（`name` 字段 + zip 文件），原样存 MinIO，不解包；编辑接口先用 `GET /skills/{id}` 把 zip 解压成 `{路径: 文本内容}` 的文件树 JSON 返给前端，保存时 `PUT /skills/{id}` 接收同样结构的 JSON（不是 zip），后端重新打包整体覆盖上传——直接对应 TASKS 原文"编辑接口拉取现有 zip 解压返回文件树""保存接口接收改动后的内容重新打包"的两句表述
+- MinIO 对象 key 固定为 `{skill_id}.zip`，每次保存原地覆盖，不按版本号生成新 key；版本号只是 Postgres `skills.version` 字段的计数器，不体现在对象存储路径里
+- v1 只支持 UTF-8 文本文件（`SKILL.md` + 脚本等），不支持二进制资源文件：解压时按 UTF-8 解码，解码失败直接判为不合法内容拒绝。原因：文件树用 JSON 传输本身不适合塞二进制，真要支持二进制资源留到后续需要时再加 base64 编码的分支，v1 不做
+- 校验规则（`app/modules/skills/storage.py::validate_files`）：内容非空、必须包含根路径下的 `SKILL.md`、路径不能是绝对路径或包含 `..`（防 zip slip）；创建（解压上传的 zip）和保存（前端传回的文件树）复用同一套校验函数，保证两个入口标准一致
+- 路径分隔符统一归一化成 `/`：实测发现 Windows `PowerShell Compress-Archive` 生成的 zip 条目会用 `\` 而不是 zip 标准的 `/`，解压时统一 `.replace("\\", "/")`，否则同一路径在文件树里可能表现成两种形式、重新打包出的 zip 也不规范
+- `name` 唯一性靠 Postgres `skills.name` 的 unique 约束兜底，创建时先 `flush()`（不 `commit()`）拿到 UUID 再传给 MinIO 存储；`IntegrityError` 时回滚并转译成业务异常（HTTP 409），避免"数据库已经报错但还是把 zip 传上去了"这种半成品状态；MinIO 上传失败同样回滚 DB，不留下 `object_key` 为空的孤儿元数据行
+- 删除顺序：先删 MinIO 对象，成功后再删 Postgres 行——如果 MinIO 删除失败就保留数据库记录，用户可以重试；不做跨存储的两阶段提交，v1 认为"重试"已经够用
+- 敏感字段/鉴权头依赖：`app/api/deps.py` 新增 `get_db_session`（FastAPI 依赖项，包一层 `async with session_factory() as session`），Skill router 整体挂 `Depends(get_current_admin)`，T1.1 交接记录里提到的"补依赖项""业务路由记得接鉴权"两件事在本任务落地
+- **顺带修了 T0.2 一个潜在 bug**：`app/db.py` 的 `dispose_engine()` 之前只清空 `_engine` 全局单例，没有同步清空 `_session_factory`（`_session_factory` 是绑定着旧 engine 创建的缓存实例）。生产环境单进程单 event loop 从不触发这个问题，但本任务写多用例的 pytest（`asyncio_mode=auto`，每个测试函数一个新 event loop）时稳定复现：`dispose_engine()` 之后下一个测试仍会拿到绑定旧 engine/旧 loop 的 `_session_factory`，导致该测试内的数据库操作报 `RuntimeError: Event loop is closed`。已修复为 `dispose_engine()` 同时清空两个全局变量；`tests/conftest.py` 相应新增 `_reset_db_engine_per_test` autouse fixture（模式与 T0.5 的 Redis 客户端重置 fixture 一致）
+
 ---
 
 ### T1.3 Skill 管理前端页面

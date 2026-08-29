@@ -36,7 +36,10 @@ async def check_database_connection() -> bool:
 
 
 async def dispose_engine() -> None:
-    global _engine
+    global _engine, _session_factory
     if _engine is not None:
         await _engine.dispose()
         _engine = None
+    # _session_factory 是绑定着上面这个 engine 创建的，一并清空，否则下次 get_session_factory()
+    # 会继续复用绑定旧 engine 的缓存实例（新 engine 建了也用不上）
+    _session_factory = None

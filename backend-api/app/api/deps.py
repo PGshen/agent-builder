@@ -1,8 +1,19 @@
-from fastapi import Header, HTTPException, status
+from collections.abc import AsyncGenerator
 
+from fastapi import Header, HTTPException, status
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.db import get_session_factory
 from app.modules.auth import service as auth_service
 
 _BEARER_PREFIX = "Bearer "
+
+
+async def get_db_session() -> AsyncGenerator[AsyncSession, None]:
+    """业务 router 统一用这个依赖项拿一个请求生命周期内的 DB session（用完自动关闭）。"""
+    session_factory = get_session_factory()
+    async with session_factory() as session:
+        yield session
 
 
 def extract_bearer_token(authorization: str | None) -> str | None:

@@ -67,3 +67,35 @@ Phase 0（T0.1~T0.5）已全部完成并归档，见上方归档索引。当前�
 - 以后新增/修改模型字段，流程是：改 `app/modules/<name>/models.py` → `uv run alembic revision --autogenerate -m "..."` → 检查生成的迁移文件（autogenerate 不总是完美，比如改字段类型、加索引名等有时需要手动调整）→ `uv run alembic upgrade head` 本地验证 → 提交时把 `alembic/versions/` 下新文件一并提交
 - `agent_repositories`/`mcp_servers` 的敏感信息处理方式在 T1.4 定下来后，如果结论是要加密存储，记得同步回来看 `agent_repositories.auth_credential` 是否要用同样方式改造（TASKS.md T2.1 已经写了"与 T1.4 保持一致"这个约束）
 - 本地起 backend-api 验证迁移：`cd backend-api && uv run alembic upgrade head`（连的是 `.env` 里 `localhost:5442`）；容器方式验证：`docker compose up -d --build backend-api`，日志里能看到 alembic 的输出在 uvicorn 启动之前
+
+## [T1.2] Skill Service（zip 存取 + CRUD API） —— 2026-08-29
+
+**状态**：已完成
+
+**完成内容**：
+- `backend-api` 新增依赖 `minio==7.2.13`（与 agent-runner 同版本）、`python-multipart==0.0.20`（FastAPI 表单/文件上传需要）
+- `app/config.py` 补了 `minio_endpoint` 属性（`{host}:{port}`），之前只有零散的 `minio_*` 字段
+- `app/api/deps.py` 新增 `get_db_session`（FastAPI 依赖项，`async with session_factory() as session: yield session`）——T1.1 交接记录里提到缺这个，本任务补上，后续业务 router 统一用它拿 DB session
+- `app/modules/skills/` 新增四个文件：
+  - `storage.py` —— MinIO 客户端单例（同步 SDK + `asyncio.to_thread` 包装，模式抄 agent-runner 的 `health.py`）；zip 打包/解包（`pack_zip`/`unpack_zip`，UTF-8 文本）；`validate_files`（非空、必须含根路径 `SKILL.md`、路径防 zip slip）；路径分隔符统一归一化成 `/`
+  - `schemas.py` —— `SkillListItem`/`SkillDetail`（含 `files` 字典）/`SkillUpdateRequest`
+  - `service.py` —— `list_skills`/`create_skill`/`get_skill_detail`/`update_skill`/`delete_skill`，`SkillNotFoundError`/`SkillNameConflictError` 两个业务异常
+  - `router.py` —— `GET/POST /skills`、`GET/PUT/DELETE /skills/{id}`，整体挂 `Depends(get_current_admin)`
+- `app/main.py` 挂载 `skills_router`
+- `tests/test_skills.py`（新增，6 个用例）+ `tests/conftest.py` 新增 `_reset_db_engine_per_test` autouse fixture
+- 手工全链路验证：`docker compose build/up backend-api` 重建镜像后，用真实 zip 文件（含 Windows `Compress-Archive` 生成的、路径分隔符是 `\` 的 zip）走了一遍 登录 → 创建 → 列表 → 详情（确认路径已归一化成 `/`）→ 编辑保存（版本号 1→2）→ 删除 → 再次 GET 返回 404 的完整闭环
+
+**关键决策与偏差**：
+- 详见已回写到 [TASKS.md](../TASKS.md) T1.2 的"决策记录"小节，要点：创建接口收 zip（multipart），编辑/保存接口收/发 JSON 文件树（不是 zip）；MinIO key 固定 `{skill_id}.zip` 原地覆盖，版本号只是 Postgres 字段；v1 只支持 UTF-8 文本文件，不支持二进制资源；名称唯一性靠 DB unique 约束 + `IntegrityError` 转译成 409；删除顺序是先删 MinIO 对象再删 DB 行
+- **顺带修了 T0.2 的一个潜在 bug**（不是本任务范围内的新决策，是排查测试失败时发现的既有缺陷）：`app/db.py::dispose_engine()` 只清空了 `_engine` 全局单例，没有同步清空同样是全局单例、绑定着旧 engine 的 `_session_factory`。生产环境单进程单 event loop 场景下这个 bug 完全不会触发（`_session_factory` 只会被创建一次，从未需要"跟着 engine 一起换新"），但本任务写多用例 pytest 时稳定复现为 `RuntimeError: Event loop is closed`（且必定是整个测试会话里最后一个碰数据库的用例失败，因为前面用例的残留 `_session_factory` 一直没被清干净，直到最后一次 dispose 才会暴露）。已修复，`tests/conftest.py` 同步加了 `_reset_db_engine_per_test` fixture
+
+**遗留问题**：
+- 二进制资源文件不支持（v1 范围内的有意限制，见决策记录），如果后续 Skill 规范需要图片/二进制脚本等资源，需要重新设计文件树的传输格式（比如按扩展名分文本/二进制两种编码）
+- `SKILL.md` 里的 YAML frontmatter（`name`/`description` 等字段）目前没有做内容级解析和与 Postgres `name` 字段的一致性校验——创建时的 `name` 是调用方显式传的表单字段，和 zip 内 `SKILL.md` frontmatter 里写的 name 可能不一致，本任务没有处理这个潜在的不一致，留给以后如果需要更严格的规范校验时再加
+- 删除失败的部分成功场景（MinIO 删除失败）目前只是把错误抛给调用方、DB 行原样保留，没有专门的重试/告警机制，v1 认为手动重试删除已经够用
+
+**给下一个任务的建议**：
+- T1.3（Skill 管理前端页面）：`GET /skills/{id}` 返回的 `files` 是 `{路径: 文本内容}` 的 flat map（不是嵌套树结构），前端如果要做文件树 UI，需要自己按路径里的 `/` 分隔符在前端建树；保存时把编辑后的完整 `files` map（不只是改动的文件）整体传给 `PUT /skills/{id}`，因为后端是整体重新打包，不做增量 patch
+- 创建页如果走"上传 zip"路线，直接对接 `POST /skills`（`multipart/form-data`：`name` 字段 + `file` 字段）；如果走"从模板创建"路线，则可以考虑前端本地构造一个含 `SKILL.md` 的最小文件树，用同样的 zip 打包后走同一个创建接口，不需要后端另开一个"从模板"专用接口
+- `app/api/deps.py` 的 `get_db_session` 现在已经就绪，T1.4（MCP Service）直接复用，不用重新写一遍数据库 session 依赖项
+- 以后写新的 async 测试如果又遇到 `RuntimeError: Event loop is closed` 或类似的跨 loop 报错，先检查是不是又出现了"模块级单例缓存了绑定旧 loop/旧资源的对象，但重置函数只清了部分变量"这种模式——这次踩的 `_session_factory` 坑和 T0.5 踩的 Redis 客户端坑是同一类问题，本质是全局单例 + pytest 每测试新 event loop 的组合，跟业务逻辑无关

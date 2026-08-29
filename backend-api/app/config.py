@@ -38,6 +38,10 @@ class Settings(BaseSettings):
     minio_bucket_skills: str = "agent-builder-skills"
     minio_bucket_workspaces: str = "agent-builder-workspaces"
 
+    @property
+    def minio_endpoint(self) -> str:
+        return f"{self.minio_host}:{self.minio_port}"
+
     # 前端与 backend-api 不同源（本地开发时端口不同），需要显式放行 CORS；逗号分隔多个 origin
     cors_allow_origins: str = "http://localhost:5173"
 
