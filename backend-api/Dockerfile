@@ -11,8 +11,12 @@ COPY pyproject.toml uv.lock ./
 RUN uv sync --locked --no-dev --no-install-project
 
 COPY app ./app
-RUN uv sync --locked --no-dev
+COPY alembic.ini ./
+COPY alembic ./alembic
+COPY entrypoint.sh ./
+RUN uv sync --locked --no-dev && chmod +x entrypoint.sh
 
 EXPOSE 8080
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080"]
+# 容器启动先 `alembic upgrade head` 把 schema 应用到最新，再起 uvicorn，保证各环境 schema 一致
+CMD ["./entrypoint.sh"]

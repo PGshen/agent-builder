@@ -137,6 +137,17 @@
 - 每个实体的字段能覆盖 TECH_DESIGN 第 5 节列出的信息，不遗漏关键字段
 - 能通过迁移工具查看当前 schema 版本和迁移历史
 
+**决策记录**（实现时落地）：
+- 迁移工具选 Alembic（`uv add alembic`），异步引擎模板（`alembic init -t async`），`alembic/env.py` 不在 `alembic.ini` 里硬编码连接串，而是运行时从 `app.config.get_settings().database_url` 读取，复用项目统一的环境变量配置方式；`alembic.ini` 本身保持纯 ASCII（Windows 下 `configparser` 用 locale 编码读取 ini 文件，本机是 GBK，写入中文注释会导致 `UnicodeDecodeError`，这是本任务踩到的坑，记录以避免下次复现）
+- ORM 模型不集中放一个 `app/models/` 目录，而是分散到各业务模块自己的 `app/modules/<name>/models.py`（`skills`/`mcp`/`agents`/`conversations`），与已有的模块划分保持一致；新增 `app/db_base.py` 存放共用的 `Base`（`DeclarativeBase`）、`UUIDPKMixin`（UUID 主键，`server_default=gen_random_uuid()`，PG16 内置无需 pgcrypto 扩展）、`TimestampMixin`（`created_at`/`updated_at`）三个模块间共用的基础设施；`alembic/env.py` 汇总 import 各模块 `models.py` 以获得完整 `Base.metadata` 供 autogenerate 使用
+- 新增 `app/modules/sessions/` 模块目录（此前不存在），专门承载 SessionStore 记录表 `sdk_sessions`，对应 TECH_DESIGN 里独立的 "SessionStore Adapter" 模块；本任务只落 `session_id`（SDK 管理，非本项目内部 UUID）+ `agent_id` + 不透明 `data` JSONB 三个字段，真正的读写接口留给 T4.1 按 SDK 实际的 SessionStore 接口实现时再细化/如需再迁移加字段
+- Agent 绑定关系用关联表而非内嵌数组：`agent_skills`/`agent_mcp_servers`（复合主键 `agent_id`+`skill_id`/`mcp_server_id`，均 `ondelete=CASCADE`）。仓库列表也用独立表 `agent_repositories`（而非 JSON 数组），因为每项仓库有 `last_synced_at`/`last_synced_commit` 等需要独立更新的字段，关系型表比 JSON 数组更适合单条更新
+- Workspace 两段式模型：`workspace_snapshots` 表与 Agent 一对一（`agent_id` 直接做主键），仓库快照与输出快照的 object_key/version/updated_at 三元组各自独立一份列，`output_snapshot_update_source` 区分 `conversation_sync`（正常同步）与 `emergency_fallback`（T4.4 异常兜底）
+- Agent 新增了 TECH_DESIGN 未明确列出的 `status_message`（Text，nullable）字段：T2.4 验收标准要求"失败"状态要能让前端展示原因，仅有 `status` 三态字符串不够表达具体失败信息，遂在数据模型阶段一并加上，避免 T2.4 时再补迁移
+- `workspace_id`（Agent 的 workspace 标识）没有直接复用主键 `id`，而是独立生成（`uuid.uuid4().hex`，唯一约束）：让"对外可见的 workspace 标识"与"内部数据库主键"解耦，即使以后 id 生成策略调整也不影响已落地的 workspace 命名
+- MCP 敏感字段加密方式、仓库凭证（`agent_repositories.auth_credential`）加密方式均未在本任务决定，`config`/`auth_credential` 先按明文列落地（类型定好），留给 T1.4/T2.1 实现时决定是否加密及如何脱敏展示，不阻塞 schema 先行
+- Backend API 容器启动流程新增 `entrypoint.sh`（`alembic upgrade head` 后再 `exec uvicorn`），`Dockerfile`/`docker-compose.yml` 未变但镜像构建多拷贝 `alembic.ini`/`alembic/`/`entrypoint.sh` 三项：保证每次容器启动都自动把 schema 应用到最新版本，环境间不会因为忘记手动跑迁移而不一致
+
 ---
 
 ### T1.2 Skill Service（zip 存取 + CRUD API）
