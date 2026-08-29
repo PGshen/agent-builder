@@ -1,0 +1,167 @@
+name: agent-builder
+
+networks:
+  agent-builder-net:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+  minio_data:
+  agent_runner_cache:
+
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      - "${POSTGRES_PORT}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - agent-builder-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7
+    restart: unless-stopped
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD}", "--appendonly", "yes"]
+    ports:
+      - "${REDIS_PORT}:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - agent-builder-net
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a ${REDIS_PASSWORD} --no-auth-warning ping | grep -q PONG"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  minio:
+    image: minio/minio:latest
+    restart: unless-stopped
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    ports:
+      - "${MINIO_PORT}:9000"
+      - "${MINIO_CONSOLE_PORT}:9001"
+    volumes:
+      - minio_data:/data
+    networks:
+      - agent-builder-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # 一次性任务：MinIO 就绪后预建约定的两个 bucket（skill 包 / workspace 快照）
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      MINIO_BUCKET_SKILLS: ${MINIO_BUCKET_SKILLS}
+      MINIO_BUCKET_WORKSPACES: ${MINIO_BUCKET_WORKSPACES}
+    networks:
+      - agent-builder-net
+    entrypoint: >
+      sh -c "
+        mc alias set local http://minio:9000 $$MINIO_ROOT_USER $$MINIO_ROOT_PASSWORD &&
+        mc mb --ignore-existing local/$$MINIO_BUCKET_SKILLS &&
+        mc mb --ignore-existing local/$$MINIO_BUCKET_WORKSPACES &&
+        echo 'buckets ready'
+      "
+    restart: "no"
+
+  backend-api:
+    build: ./backend-api
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # compose 网络内部访问依赖服务时用服务名 + 组件标准端口，覆盖 .env 里给宿主机本地开发用的 localhost/映射端口
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      MINIO_HOST: minio
+      MINIO_PORT: 9000
+    ports:
+      - "${BACKEND_API_PORT}:8080"
+    networks:
+      - agent-builder-net
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8080/health').status in (200,503) else 1)"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  agent-runner:
+    build: ./agent-runner
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # 同 backend-api：compose 网络内部用服务名 + 组件标准端口覆盖 .env 里给宿主机本地开发用的值
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      MINIO_HOST: minio
+      MINIO_PORT: 9000
+      # 本地临时磁盘缓存目录改成容器内绝对路径，挂到具名 volume 上（跨容器重建保留，供 T6.1 的 15 天不活动清理任务使用）
+      RUNNER_LOCAL_CACHE_DIR: /var/lib/agent-runner/cache
+    volumes:
+      - agent_runner_cache:/var/lib/agent-runner/cache
+    networks:
+      - agent-builder-net
+    # 不对外发布宿主机端口：Backend API 通过 compose 服务名 DNS 轮询直连各副本（TECH_DESIGN 2），
+    # --scale agent-runner=N 时多副本没法共享同一个宿主机端口映射
+    expose:
+      - "8100"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8100/health').status in (200,503) else 1)"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  frontend:
+    build: ./frontend
+    restart: unless-stopped
+    env_file: .env
+    # VITE_API_BASE_URL 不需要覆盖：请求是浏览器发起的，不管 frontend 本身跑在容器里还是本地，
+    # 浏览器都只能通过宿主机地址访问 backend-api，跟 backend-api/agent-runner 那种"容器内部用服务名"的覆盖不是一回事
+    ports:
+      - "${FRONTEND_PORT}:5173"
+    networks:
+      - agent-builder-net
+    depends_on:
+      backend-api:
+        condition: service_healthy

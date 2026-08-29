@@ -1,0 +1,10 @@
+.env
+__pycache__/
+*.pyc
+node_modules/
+dist/
+.venv/
+.pytest_cache/
+.cache/
+.make-pids/
+.make-logs/
