@@ -68,3 +68,45 @@ def test_clone_repository_raises_workspace_init_error_for_unreachable_repo(tmp_p
 
     with pytest.raises(git_ops.WorkspaceInitError):
         git_ops.clone_repository(repo, dest)
+
+
+def test_remote_head_commit_matches_actual_head(tmp_path: Path):
+    source = tmp_path / "source"
+    expected_commit = _init_local_repo(source)
+    repo = RepositoryRecord(
+        id=uuid.uuid4(), url=str(source), branch=None, auth_type="none", auth_credential=None, position=0
+    )
+
+    assert git_ops.remote_head_commit(repo) == expected_commit
+
+
+def test_remote_head_commit_reflects_new_commits_without_cloning(tmp_path: Path):
+    source = tmp_path / "source"
+    _init_local_repo(source)
+
+    (source / "README.md").write_text("updated")
+    subprocess.run(["git", "add", "README.md"], cwd=source, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "update"], cwd=source, check=True)
+    expected_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=source, capture_output=True, text=True, check=True
+    ).stdout.strip()
+
+    repo = RepositoryRecord(
+        id=uuid.uuid4(), url=str(source), branch=None, auth_type="none", auth_credential=None, position=0
+    )
+
+    assert git_ops.remote_head_commit(repo) == expected_commit
+
+
+def test_remote_head_commit_raises_workspace_init_error_for_unreachable_repo(tmp_path: Path):
+    repo = RepositoryRecord(
+        id=uuid.uuid4(),
+        url=str(tmp_path / "does-not-exist"),
+        branch=None,
+        auth_type="none",
+        auth_credential=None,
+        position=0,
+    )
+
+    with pytest.raises(git_ops.WorkspaceInitError):
+        git_ops.remote_head_commit(repo)

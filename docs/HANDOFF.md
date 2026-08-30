@@ -68,3 +68,43 @@ Phase 0（T0.1~T0.5）、Phase 1（T1.1~T1.5）、Phase 2（T2.1~T2.4）均已�
 - T2.3 交接记录建议过"可以把 `_clone_and_pack` 里 clone+打包这部分抽出来给 init/refresh 两边共用"，本任务没有动 `agent-runner/app/workspace/` 下的任何代码（T3.1 是纯 scheduler 侧的工作），这个抽象留给 T3.2 视实际情况决定是否要做
 - T3.2 要留意 TASKS.md T3.2 原有的验收标准之一"一次对话执行期间触发刷新，不会相互阻塞或报错"——本任务的 scheduler 派发逻辑本身已经不依赖、不等待 Agent 互斥锁（T4.2 还没实现），刷新是否真的和对话执行无冲突，要等 T3.2 的具体 clone/打包实现 + T4.2 落地后才能完整验证
 - 验证方式：`uv run pytest`（`scheduler/` 目录下，新增 11 个用例全过）；`uv run pytest`（`backend-api/` 目录下，`queue="agent-runner"` 改动后 21 个用例回归全过）；`docker compose build/up backend-api agent-runner scheduler` 后用数据库里真实存在的一个过期未同步的 ready Agent 观察了完整链路：`scheduler` 按 60 秒周期扫描 → 到期后派发（`scheduler_dispatch_refresh` 日志）→ 确认消息 `routing_key` 是 `"agent-runner"` 而非共享的 `"celery"` → 下一轮扫描被派发锁跳过（`scheduler_dispatch_skipped_locked`）→ 手动 `redis-cli -n 4 DEL` 清锁后确认能立即重新派发。全程未新建/删除任何测试数据（用的是数据库里已有的旧 Agent），未清理 broker 队列消息（T3.2 上线前这些消息本来就会被 agent-runner 当 unregistered task 丢弃，不会累积、不会被将来的 T3.2 worker 消费到脏数据）
+
+---
+
+## [T3.2] 仓库刷新任务 —— 2026-08-30
+
+**状态**：已完成
+
+**完成内容**：
+- `agent-runner/app/worker/tasks/refresh.py`（新增）：`@celery_app.task(name="workspace.refresh_repos")`，消费 T3.1 已经在跑的 `"workspace.refresh_repos"` 任务。逻辑上是 `workspace.init`（T2.3）的裁剪版——`load_agent_context` 拿到 Agent 名下全部仓库 → 逐个 `git_ops.clone_repository` → `archive.zip_directory` 打包 → `storage.put_workspace_object` 上传新版本仓库快照 → 只更新 `workspace_snapshots` 的 `repo_snapshot_*` 三列，**全程不调用 `mark_agent_status`**（不像 init 那样把 Agent 打成 initializing/ready/failed），也不touch `output_snapshot_*`
+- `agent-runner/app/workspace/db.py` 新增两个函数：`update_repo_snapshot(agent_id, repo_snapshot_object_key, repo_snapshot_version)`（只 UPDATE 仓库快照三列，不是 UPSERT——刷新时该行必然已存在）、`update_repository_sync_error(repo_id, error_message)`（只写 `last_sync_error`，不动 `last_synced_at`/`last_synced_commit`）；`update_repository_sync_info`（init/refresh 共用）顺带在成功时清空 `last_sync_error`
+- **backend-api 新增字段** `agent_repositories.last_sync_error`（Text，nullable）承载"记录失败信息"：`app/modules/agents/models.py` 加列、`schemas.py` 的 `AgentRepositoryDetail` 加字段、`router.py` 构造处补上、新增 Alembic 迁移 `backend-api/alembic/versions/7c2a4e1f9b3d_agent_repository_last_sync_error.py`（`down_revision` 接在 T2.1 补丁的 `dbf10ea831f1` 之后）
+- `agent-runner/app/worker/celery_app.py` 的 `include` 列表加上 `"app.worker.tasks.refresh"`
+- 新增测试 `agent-runner/tests/test_workspace_refresh_task.py`（后续被"补丁"小节重写为 6 个用例，见下方）
+
+**关键决策与偏差**：
+- 已回写到 [TASKS.md](../TASKS.md) T3.2 的"决策记录"小节，要点见上方，核心是：**直接复用 T2.3 的 `git_ops.py`/`archive.py`/`storage.py`/`crypto.py`/`AgentInitContext`/`load_agent_context`，不做额外抽象**——T2.3 交接记录建议过"可以把 clone+打包抽出来共用"，但实际写下来发现刷新任务本身已经足够薄（`_clone_and_pack` 只是去掉了 output 快照那部分），复用现有函数即可，不需要再抽一层
+- **`last_sync_error` 是本任务新增的字段**，TASKS.md 原文"记录失败信息"没写清楚落在哪——Agent 表的 `status_message` 语义上绑定 Agent 整体状态，而刷新决策要求不碰 Agent 状态，所以选了仓库级新字段，粒度对得上"是哪个仓库刷新失败"。这是超出任务描述原文、但没有冲突现有决策的补充，已回写 TASKS.md
+- **多仓库场景是全有全无（all-or-nothing）**：任意一个仓库 clone 失败，整轮刷新放弃、不落新版本快照，只把失败原因记到那一个出错的仓库上，跟它一起"陪跑"的其它仓库自身 `last_sync_error`/`last_synced_at` 不受影响（它们没有出错，只是所在的这轮刷新被回滚）。这个是延续 T2.3 `workspace.init` 的"整体失败不做部分成功"策略做的选择，TASKS.md 原文没有明确要求 all-or-nothing 还是逐仓库独立提交，做了个和 T2.3 一致的决定
+
+**遗留问题**：
+- TASKS.md T3.2 第三条验收标准"一次对话执行期间触发刷新，不会相互阻塞或报错"**仍未完整验证**：T4.2（Agent 互斥锁）还没实现，本任务只能确认刷新任务本身不 touch 任何对话执行相关的状态/锁，理论上不会冲突，但没有真正跑一次"对话执行中触发刷新"的并发场景。留给 T4.2 落地后补验证
+- `agent_repositories.last_sync_error` 目前只有后端字段和 API 暴露，**前端没有展示**（Agent 详情页目前只展示 Agent 级 `status_message`）。留给 T5.x 或有需要时再加，不阻塞当前任务
+- 与历次任务一致的已知遗留：MinIO 历史快照对象（`repo-v1.zip`/`repo-v2.zip`/…）没有清理机制，刷新越多、历史版本堆积越多，仍未解决
+
+**给下一个任务的建议**：
+- Agent 互斥锁（T4.2）落地时，可以直接对照本任务"刷新读写不冲突"的设计假设做验证：刷新只新增 MinIO 对象、只在最后一步整体切换 `workspace_snapshots` 指针，旧版本对象在切换前始终可读，理论上不需要跟对话执行的互斥锁产生任何交互
+- 验证方式：`uv run pytest`（`agent-runner/` 目录下，17 个用例全过，新增 4 个）；`uv run pytest`（`backend-api/` 目录下，`uv run alembic upgrade head` 应用新迁移后 21 个用例全过）；`docker compose build backend-api agent-runner` + `up -d` 重建镜像后用真实容器链路验证：① 创建一个绑定真实仓库 `https://github.com/PGshen/chat-web.git`、`repo_refresh_interval_minutes=1` 的 Agent，等 T2.3 `workspace.init` 跑完到 `ready`（`repo-v1.zip`）；② 等 scheduler 到期派发 `workspace.refresh_repos`（60 秒扫描周期内自动触发，未手动构造消息），确认 `workspace_refresh_succeeded` 日志、MinIO 新增 `repo-v2.zip`、`workspace_snapshots.repo_snapshot_version` 变成 2 且 `output_snapshot_version`/`output_snapshot_object_key` 原样不动、`agent_repositories.last_synced_at` 更新、`last_sync_error` 为空；③ 把仓库 URL 改成不存在的地址、手动清掉 Redis 派发锁触发立即重试，确认 `workspace_refresh_failed` 日志、`workspace_snapshots` 仍停在 v2（未产生 v3、未覆盖已有对象）、`agent_repositories.last_synced_at`/`last_synced_commit` 保持刷新前的值不变、`last_sync_error` 写入了脱敏后的 git 报错信息、Agent `status` 全程是 `ready`（未被打成 failed）；验证完删除了测试 Agent 并清理了对应的 3 个 MinIO 对象（`repo-v1.zip`/`repo-v2.zip`/`output-v1.zip`）
+
+### 补丁：仓库无更新时跳过快照写入 —— 2026-08-30
+
+**背景（用户在验收时发现的问题）**：上面这版实现里 `_clone_and_pack` 无条件执行——只要到达刷新周期就重新 clone、打包、上传一份新版本 zip、`repo_snapshot_version` 无脑 +1，哪怕仓库自上次同步后完全没有新提交。长期不更新的仓库会在每个刷新周期都产生一份内容和上一版完全相同的快照，MinIO 存储和 `workspace_snapshots` 版本号会无意义膨胀，跟 TASKS.md 决策"独立版本化"的本意（版本号应该反映真实变更）不符。
+
+**修复**：刷新前先做一次轻量的"有没有更新"检查，只有真的有变化才重新 clone+打包+上传。
+- `agent-runner/app/workspace/git_ops.py` 新增 `remote_head_commit(repo) -> str`，用 `git ls-remote <url> <branch-or-HEAD>` 只查询远程当前指向的 commit，不下载任何内容；把 `clone_repository` 里原本内联的凭证准备逻辑（token 拼 URL / ssh_key 落临时文件 + `GIT_SSH_COMMAND`）抽成 `_prepared_auth` 上下文管理器，`clone_repository` 和 `remote_head_commit` 共用，避免重复
+- `agent-runner/app/workspace/db.py` 的 `RepositoryRecord` 新增 `last_synced_commit: str | None = None` 字段，`load_agent_context` 的 SQL 一并 SELECT 出来（之前这个查询只取 clone 需要的字段，没取这一列）
+- `agent-runner/app/worker/tasks/refresh.py` 的 `_run` 改成两阶段：先 `_resolve_remote_commits` 对每个仓库跑 `remote_head_commit` 拿到远程当前 commit；**如果全部仓库的远程 commit 都等于各自的 `last_synced_commit`，直接返回 `"unchanged"`**——跳过 `_clone_and_pack`，但仍然对每个仓库调用 `update_repository_sync_info(repo_id, 远程commit)` 把 `last_synced_at` 刷新到当前时间（commit 值不变，只是时间戳前进）；只要有一个仓库的远程 commit 变了，才走原来的整体重新 clone+打包+上传流程（快照是全部仓库的组合 zip，没有做单仓库增量更新的粒度）。远程查询本身失败（仓库不可达）跟原来 clone 失败一样处理：整体放弃，把失败原因记到 `last_sync_error`
+- **`last_synced_at` 在"无变化"分支也必须推进**是这次修复里容易漏掉的一点：如果跳过打包时完全不写库，这个 Agent 的 `last_synced_at` 停留在上一次真正变更的时间，下一次 scheduler 扫描（默认 60 秒一次）会立刻又判定它"到期"、重新派发，变成事实上每 60 秒都要查一次远程，架空了用户在 Agent 上配置的 `repo_refresh_interval_minutes`
+- 测试：`agent-runner/tests/test_workspace_refresh_task.py` 重写为 6 个用例（新增"远程无变化时跳过 clone+打包但推进 last_synced_at"、"远程查询本身失败时不进入 clone 阶段"两个）；`agent-runner/tests/test_workspace_git_ops.py` 新增 3 个 `remote_head_commit` 的真实本地仓库用例（正确返回 HEAD、能感知新提交、仓库不可达时报 `WorkspaceInitError`）
+
+**验证方式**：`uv run pytest`（`agent-runner/` 目录下 22 个用例全过）；`docker compose build/up agent-runner` 重建镜像后用真实容器链路验证：创建一个绑定 `https://github.com/PGshen/chat-web.git`、`repo_refresh_interval_minutes=1` 的新 Agent，等 `workspace.init` 完成（`repo-v1.zip`）→ 等 scheduler 到期自动派发刷新（未手动触发）→ 确认日志是 `workspace_refresh_unchanged`（不是 `workspace_refresh_succeeded`）→ 确认 `workspace_snapshots.repo_snapshot_version` 仍是 1、MinIO 里没有出现 `repo-v2.zip`、`agent_repositories.last_synced_at` 确实推进到了刷新发生的时间点、`last_synced_commit` 不变；验证完删除了测试 Agent 并清理了对应的 2 个 MinIO 对象（`repo-v1.zip`/`output-v1.zip`）

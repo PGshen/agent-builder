@@ -10,7 +10,7 @@ celery_app = Celery(
     "agent-runner",
     broker=settings.celery_broker_url,
     backend=settings.celery_result_backend,
-    include=["app.worker.tasks.probe", "app.worker.tasks.workspace"],
+    include=["app.worker.tasks.probe", "app.worker.tasks.workspace", "app.worker.tasks.refresh"],
 )
 
 celery_app.conf.update(

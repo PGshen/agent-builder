@@ -403,11 +403,23 @@
 - 刷新独立于对话执行的互斥锁进行（对应 TECH_DESIGN 4.3 的决策：仓库只读，不存在本地分叉，不需要等待锁空闲）
 - 刷新只更新仓库快照部分，不触碰输出快照，两者版本独立
 - 刷新失败（如仓库地址失效）时保留上一次成功的快照不变，并记录失败信息，不影响 Agent 当前可用性
+- **到期不等于一定要重新打包上传**：刷新前先轻量判断仓库是否真的有新提交，没有变化就跳过 clone+打包+写 MinIO，只刷新"已检查过"的时间戳；否则每个仓库到期都无条件产生一份新版本快照，长期不更新的仓库也会让 `workspace_snapshots` 版本号和 MinIO 存储空间无意义膨胀
 
 **验收标准**：
-- 到达刷新周期后，MinIO 里的仓库快照更新时间和内容确实反映了仓库最新提交
+- 到达刷新周期后，若仓库确有新提交，MinIO 里的仓库快照更新时间和内容确实反映了仓库最新提交
+- **到达刷新周期但仓库没有新提交时，不产生新的 MinIO 对象、`workspace_snapshots.repo_snapshot_version` 不变**，但下一次到期判断的时间基准（`last_synced_at`）仍要推进，不能因为跳过打包就导致该 Agent 一直"到期"、每次扫描都被重新判定需要刷新
 - 模拟仓库地址失效的情况，刷新失败但不影响已有快照可用、Agent 仍可正常发起对话
 - 一次对话执行期间触发刷新，不会相互阻塞或报错（验证读写不冲突的设计）
+
+**决策记录**（实现时落地）：
+- **消费方直接复用 T2.3 `agent-runner/app/workspace/` 下的 `git_ops.py`/`archive.py`/`storage.py`/`crypto.py`（原样不改），新增 `agent-runner/app/worker/tasks/refresh.py` 注册 `@celery_app.task(name="workspace.refresh_repos")`**——契约在 T3.1 就已经约定好（`args=[agent_id]`，同一个 `agent-runner` 队列），Runner 侧只需要新增消费逻辑；`load_agent_context`/`RepositoryRecord`/`AgentInitContext` 也直接复用（虽然名字带"Init"，但字段——workspace_id/repositories/repo_snapshot_version——刷新同样需要，没有另起一套 dataclass 的必要）
+- **`app/workspace/db.py` 新增两个刷新专用的写函数，不复用 `save_workspace_snapshot`**：`update_repo_snapshot(agent_id, repo_snapshot_object_key, repo_snapshot_version)` 只 UPDATE `workspace_snapshots` 的 `repo_snapshot_*` 三列（刷新时该行必然已存在，不需要 UPSERT）；`update_repository_sync_error(repo_id, error_message)` 只写 `agent_repositories.last_sync_error`，不动 `last_synced_at`/`last_synced_commit`。`update_repository_sync_info`（init/refresh 共用）顺带在成功时把 `last_sync_error` 清空，避免旧的失败信息在下次成功后仍然展示
+- **失败信息落地到新增字段 `agent_repositories.last_sync_error`（Text，nullable）**，而不是只写日志：TASKS.md 原文"记录失败信息"没有约束具体落地位置，但 Agent 表的 `status_message` 只在失败态才有意义、且刷新不改 Agent 状态，没有合适的地方存；给 repo 级加一列更符合"哪个仓库刷新失败"的粒度，backend-api `AgentRepositoryDetail` 一并加了这个字段方便前端后续展示（本任务不含前端改动，只加了 API 字段）。对应新增 Alembic 迁移 `7c2a4e1f9b3d_agent_repository_last_sync_error`
+- **多仓库场景下任意一个仓库 clone 失败，整体放弃本次刷新**（不做部分快照），与 `workspace.init` 的"整体失败、不做部分成功"策略一致；用内部异常 `_RepoRefreshError` 把失败的具体 `repo_id` 带出 `_clone_and_pack`，只标记那一个仓库的 `last_sync_error`，其余仓库这轮"陪跑失败"但自身 `last_sync_error`/`last_synced_at` 不受影响（它们本身没出错，只是所在的这次刷新被回滚）
+- **`mark_agent_status` 全程不调用**：`_run` 里没有任何一条路径会碰 `Agent.status`/`status_message`，成功/失败/agent_not_found/no_repositories/unchanged 五种返回值都只影响 repo 级和 `workspace_snapshots` 的仓库快照部分，直接满足"刷新不影响 Agent 当前可用性"
+- **更新检查用 `git ls-remote`，不是"先 clone 再比较"**：`git_ops.py` 新增 `remote_head_commit(repo)`，只查询远程 `HEAD`（或 `repo.branch` 指定分支）当前指向的 commit，不下载任何内容，跟 `agent_repositories.last_synced_commit` 比对；clone 需要的凭证准备逻辑（token 拼 URL / ssh_key 落临时文件）从 `clone_repository` 里抽成 `_prepared_auth` 上下文管理器给两边共用。为此 Runner 侧 `RepositoryRecord`（`app/workspace/db.py`）新增了 `last_synced_commit` 字段、`load_agent_context` 的 SQL 一并查出来
+- **多仓库任意一个变了就整体重新 clone+打包全部仓库**（不是只重新 clone 变化的那个）：快照是"全部绑定仓库"的一个组合 zip，没有对单仓库做增量更新的粒度，逐仓库精细化留到后续如果真的有性能问题再优化；全部仓库都没变时才真正跳过，返回值 `"unchanged"`
+- **跳过打包的分支仍然调用 `update_repository_sync_info` 刷新 `last_synced_at`**（commit 值不变，只是时间戳往前推）：`scheduler` 的到期判断只看 `last_synced_at`，如果跳过时完全不写库，这个 Agent 会在下一次 60 秒扫描时立刻又被判定到期、重新派发，变成"每 60 秒查一次远程"而不是尊重用户配置的 `repo_refresh_interval_minutes`
 
 ---
 

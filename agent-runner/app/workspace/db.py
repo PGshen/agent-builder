@@ -22,6 +22,9 @@ class RepositoryRecord:
     auth_type: str
     auth_credential: str | None
     position: int
+    # 上一次成功同步的 commit；定时刷新（T3.2）用它跟远程当前 HEAD 比较，判断是否真的需要
+    # 重新 clone+打包，没有变化时避免无意义地写一份新快照
+    last_synced_commit: str | None = None
 
 
 @dataclass
@@ -44,7 +47,7 @@ async def load_agent_context(agent_id: uuid.UUID) -> AgentInitContext | None:
 
         repo_rows = await conn.fetch(
             """
-            SELECT id, url, branch, auth_type, auth_credential, position
+            SELECT id, url, branch, auth_type, auth_credential, position, last_synced_commit
             FROM agent_repositories
             WHERE agent_id = $1
             ORDER BY position
@@ -126,9 +129,48 @@ async def update_repository_sync_info(repo_id: uuid.UUID, commit: str) -> None:
     conn = await asyncpg.connect(dsn=get_settings().postgres_dsn)
     try:
         await conn.execute(
-            "UPDATE agent_repositories SET last_synced_at = now(), last_synced_commit = $2 WHERE id = $1",
+            """
+            UPDATE agent_repositories
+            SET last_synced_at = now(), last_synced_commit = $2, last_sync_error = NULL
+            WHERE id = $1
+            """,
             repo_id,
             commit,
+        )
+    finally:
+        await conn.close()
+
+
+async def update_repository_sync_error(repo_id: uuid.UUID, error_message: str) -> None:
+    """记录某个仓库本轮刷新失败的原因，不动 `last_synced_at`/`last_synced_commit`
+    （TASKS.md T3.2 决策：保留上一次成功的快照/同步信息不变）。"""
+
+    conn = await asyncpg.connect(dsn=get_settings().postgres_dsn)
+    try:
+        await conn.execute(
+            "UPDATE agent_repositories SET last_sync_error = $2 WHERE id = $1",
+            repo_id,
+            error_message,
+        )
+    finally:
+        await conn.close()
+
+
+async def update_repo_snapshot(agent_id: uuid.UUID, repo_snapshot_object_key: str, repo_snapshot_version: int) -> None:
+    """定时刷新（T3.2）只更新仓库快照部分，不像 `save_workspace_snapshot` 那样连带写输出快照——
+    刷新时 Agent 早已初始化完成，`workspace_snapshots` 行必然存在，直接 UPDATE 即可。"""
+
+    conn = await asyncpg.connect(dsn=get_settings().postgres_dsn)
+    try:
+        await conn.execute(
+            """
+            UPDATE workspace_snapshots
+            SET repo_snapshot_object_key = $2, repo_snapshot_version = $3, repo_snapshot_updated_at = now()
+            WHERE agent_id = $1
+            """,
+            agent_id,
+            repo_snapshot_object_key,
+            repo_snapshot_version,
         )
     finally:
         await conn.close()

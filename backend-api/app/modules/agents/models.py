@@ -75,6 +75,8 @@ class AgentRepository(Base, UUIDPKMixin, TimestampMixin):
     position: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     last_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_synced_commit: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # 定时刷新（T3.2）失败原因；刷新成功时清空，不影响 Agent 当前可用性，仅供展示排查
+    last_sync_error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class WorkspaceSnapshot(Base):

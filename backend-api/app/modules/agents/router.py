@@ -62,6 +62,7 @@ def _to_detail(
                 position=repo.position,
                 last_synced_at=repo.last_synced_at,
                 last_synced_commit=repo.last_synced_commit,
+                last_sync_error=repo.last_sync_error,
             )
             for repo in repositories
         ],

@@ -27,6 +27,7 @@ class AgentRepositoryDetail(BaseModel):
     position: int
     last_synced_at: datetime | None
     last_synced_commit: str | None
+    last_sync_error: str | None
 
 
 class AgentCreateRequest(BaseModel):

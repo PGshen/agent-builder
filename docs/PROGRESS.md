@@ -2,7 +2,7 @@
 
 > 状态取值：未开始 / 进行中 / 已完成 / 阻塞。每个任务的目标、关键实现决策、验收标准见 [TASKS.md](./TASKS.md)（ID 一一对应）。开发过程中如决策有调整，先回到 [PRD.md](./PRD.md) / [TECH_DESIGN.md](./TECH_DESIGN.md) 更新，再回来改任务内容。
 
-最后更新：2026-08-30（T3.1 Scheduler 服务完成后）
+最后更新：2026-08-30（T3.2 仓库刷新任务完成后）
 
 ## Phase 0：基础设施与骨架
 
@@ -38,7 +38,7 @@
 | ID | 任务 | 状态 | 备注 |
 |---|---|---|---|
 | T3.1 | Scheduler 服务（Celery beat） | 已完成 | 详见 HANDOFF.md 对应记录（含 Celery 队列路由修复，回头影响 T2.1 的 `trigger_workspace_init`） |
-| T3.2 | 仓库刷新任务 | 未开始 | |
+| T3.2 | 仓库刷新任务 | 已完成 | 详见 HANDOFF.md 对应记录（新增 `agent_repositories.last_sync_error` 字段） |
 
 ## Phase 4：对话执行核心链路
 
