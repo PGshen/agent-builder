@@ -70,3 +70,53 @@ Phase 0（T0.1~T0.5）、Phase 1（T1.1~T1.5）均已全部完成并归档，见
 - Agent 状态是 `initializing`/`ready`/`failed`（T2.4 定义），T2.2 详情页展示状态用的字段是 `AgentDetail.status`/`status_message`，创建接口返回的初始状态永远是 `"initializing"`
 - T2.3（Workspace 初始化任务）落地时：Runner 侧要在 `agent-runner/app/worker/tasks/` 下新增一个任务，`@celery_app.task(name="workspace.init")`，接受 `agent_id`（字符串）参数；backend-api 这边已经在发这个任务了，不需要改 backend-api 代码，只需要 Runner 侧实现消费逻辑（clone、打包、更新 Postgres 里的 `Agent.status`/`status_message`/`WorkspaceSnapshot` 各字段）
 - T2.4 如果要实现"失败状态下重试"，直接复用 `app/modules/agents/tasks.py::trigger_workspace_init(agent_id)` 即可，不需要重新写发送逻辑，只需要在重试接口里调用它 + 把 `Agent.status` 重置回 `"initializing"`
+
+## [T2.2] Agent Builder 前端页面 —— 2026-08-30
+
+**状态**：已完成
+
+**完成内容**：
+- `frontend/src/lib/agentsApi.ts`：新增 `listAgents`/`getAgent`/`createAgent`/`updateAgent`/`deleteAgent` 请求封装，`REPO_CREDENTIAL_MASK` 常量、`AgentAuthType`/`AgentStatus`/`PermissionMode` 类型、`PERMISSION_MODE_OPTIONS` 选项表
+- `frontend/src/components/agents/RepositoryListEditor.tsx`：仓库列表编辑器（新增/删除行、URL/分支输入、鉴权方式 Select、凭证输入）
+- 三个页面替换掉 T0.4 留的 `AgentBuilderPage.tsx` 占位页（已删除）：
+  - `pages/AgentsPage.tsx` —— 列表页（名称/状态/权限模式/绑定计数/更新时间）
+  - `pages/AgentFormPage.tsx` —— 创建（`/agents/new`）与编辑（`/agents/:id/edit`）复用的表单页，`useParams().id` 是否存在区分模式
+  - `pages/AgentDetailPage.tsx` —— 详情页（状态/权限模式/仓库刷新周期/workspace_id/skills·MCP·仓库绑定明细），带"刷新状态"/"编辑"/"删除"三个操作
+- `App.tsx` 路由改为四条：`/agents`、`/agents/new`、`/agents/:id`、`/agents/:id/edit`
+- 新增 shadcn 组件 `checkbox`/`select`（`pnpm dlx shadcn@latest add checkbox select`）
+
+**关键决策与偏差**：
+- 详见已回写到 [TASKS.md](../TASKS.md) T2.2 的"决策记录"小节，要点：创建/编辑不用 Sheet 抽屉、改用独立路由页面（TASKS 原文要求"创建后跳转到详情页"，跟 T1.3/T1.5 的抽屉模式不兼容）；`permissionMode` 在本任务落地时决定直接暴露 SDK 原生四个取值（`default`/`acceptEdits`/`bypassPermissions`/`plan`），不做产品层封装，这个决策同时解决了 TECH_DESIGN 8 节遗留的"待确认"项；仓库鉴权凭证的打码占位符交互与 T1.5 MCP 表单一致（未修改原样提交，后端自动识别保留旧值）
+- 详情页状态展示只做手动"刷新状态"按钮，没有自动轮询也没有失败重试入口——这两项 TASKS 原文明确留给 T2.4，本任务只需要满足"创建后能在详情页看到初始化状态"这一条验收标准
+
+**遗留问题**：
+- T2.4 需要在 `AgentDetailPage.tsx` 补上：状态自动轮询（初始化中时定期重新拉取）+ 失败状态下的"重试"按钮（调用一个新的重试接口，T2.1 交接记录建议直接复用 `trigger_workspace_init`）
+- 目前详情页看到的 `status` 永远是创建时的 `"initializing"`（因为 T2.3 Workspace 初始化任务还没有 worker 消费，状态不会自动流转），需要等 T2.3/T2.4 落地后才能验证"就绪"/"失败"两种状态在页面上的实际展示效果，本任务只验证了字段渲染逻辑本身（用当前唯一可能出现的 `initializing` 状态跑通了闭环）
+- `AgentFormPage.tsx` 里 skills/MCP 是简单的勾选列表（无分页/搜索），如果后续 Skill/MCP 数量变多，可能需要加搜索框或分页，本任务没有考虑这个规模问题
+
+**给下一个任务的建议**：
+- T2.3（Workspace 初始化任务）落地后，可以用真实的 clone 失败场景验证 `AgentDetailPage.tsx` 的"失败"状态展示（`status_message` 已经在页面上接好了展示位置，红色提示框，`agent.status === 'failed' && agent.status_message` 条件渲染）
+- T2.4 实现自动轮询时，注意 `AgentDetailPage.tsx` 目前的 `useEffect` 只在 `id` 变化时拉取一次；加轮询时应该用 `setInterval`/`setTimeout` 循环调用现成的 `handleRefresh()` 逻辑（已经是可复用的独立函数），并在状态变成 `ready`/`failed`（终态）后停止轮询，避免无意义的持续请求
+- `PERMISSION_MODE_OPTIONS`（`lib/agentsApi.ts`）如果后续要改成产品层封装的语义（而不是直接透传 SDK 枚举），这是唯一需要改的地方，表单和详情页都是从这个常量数组渲染的，不需要改页面组件
+
+## [T2.2 补充] Agent Builder 交互优化 —— 2026-08-30
+
+**状态**：已完成
+
+**完成内容**：
+- 用户反馈三点，详见已回写到 [TASKS.md](../TASKS.md) T2.2 的"决策记录（2026-08-30 交互优化追加）"小节，这里只列文件变更：
+  - 创建/编辑从独立路由页面改回侧边抽屉：删除 `pages/AgentFormPage.tsx`/`AgentDetailPage.tsx`，新增 `components/agents/AgentEditorSheet.tsx`，`App.tsx` 路由收敛回只有 `/agents` 一条，`pages/AgentsPage.tsx` 改用 `key={editingId-openSeq}` 强制重挂载的抽屉模式（跟 Skill/MCP 列表页一致）
+  - 新增 Agent 能力描述字段：`backend-api/app/modules/agents/models.py` 加 `description` 列 + 新迁移 `dbf10ea831f1_agent_description.py`；`schemas.py`（`AgentCreateRequest`/`AgentListItem`/`AgentDetail`）、`service.py`（`create_agent`/`update_agent`）、`router.py` 三处同步加字段；`docker compose build/up backend-api` 已重建镜像并跑过迁移
+  - skills/MCP 绑定从 Checkbox 竖直列表改成可过滤穿梭器：新增 `components/agents/TransferList.tsx`（自研，非第三方库）
+- `frontend/src/lib/agentsApi.ts` 加 `description` 字段（`AgentListItem`/`AgentDetail`/`AgentFormInput`）
+
+**关键决策与偏差**：
+- 详见 TASKS.md 决策记录，要点：Sheet 模式下"创建后能看到初始化状态"这条验收标准靠"抽屉原地切换成编辑态"满足，不再需要路由跳转；`TransferList` 是通用组件（`{id,label}[]` + 受控 value/onChange），不绑定 Agent 具体类型，未来其它模块如果有类似"从一堆选项里挑几个"的需求可以直接复用，不需要重新造
+
+**遗留问题**：
+- 与 T2.2 初版遗留问题一致，仍未解决：状态自动轮询、失败重试按钮留给 T2.4；`status` 目前只能看到 `initializing`（T2.3 worker 还没实现，不会真正流转到 `ready`/`failed`）
+- `TransferList` 没有做虚拟滚动，Skill/MCP 数量如果涨到几百上千条，`max-h-56/64 overflow-y-auto` 的简单滚动列表可能会有性能问题，v1 暂不处理
+
+**给下一个任务的建议**：
+- T2.4 实现状态轮询时，改动位置在 `components/agents/AgentEditorSheet.tsx` 而不是某个独立的详情页组件了——`handleRefreshStatus`（已经是可复用的独立函数）可以直接被一个 `setInterval` 循环调用，抽屉打开且 `workingId` 非空、状态是 `initializing` 时启动轮询，变成终态（`ready`/`failed`）或抽屉关闭时停止
+- 如果后续还有其它地方需要"从一批选项里多选几个，带搜索"的交互（比如 T5.x 对外 API 权限范围选择之类），优先复用 `components/agents/TransferList.tsx`，必要时把它挪到更通用的位置（比如 `components/common/`），而不是重新写一个

@@ -300,12 +300,27 @@
 **目标**：实现 Agent 的可视化创建/编辑界面。
 
 **关键实现决策**：
-- 表单支持从已有 Skill/MCP 列表里勾选绑定，仓库地址支持添加多个
-- 创建后跳转到 Agent 详情页，展示当前 workspace 初始化状态（对应 T2.4）
+- 表单支持从已有 Skill/MCP 列表里勾选绑定（可过滤的穿梭器组件，2026-08-30 交互优化后的决策），仓库地址支持添加多个
+- 新建/编辑用侧边抽屉（Sheet）承载，不做独立路由页面——创建成功后抽屉原地切换成编辑态，展示当前 workspace 初始化状态（对应 T2.4），与 T1.3 Skill 管理的交互模式保持一致（2026-08-30 交互优化后的决策，见下方决策记录）
 
 **验收标准**：
 - 能在页面上完成"选 skills → 选 MCP → 填仓库地址 → 提交创建"的完整流程
-- 创建后能在详情页看到该 Agent 的绑定信息和初始化状态
+- 创建后能看到该 Agent 的绑定信息和初始化状态
+
+**决策记录**（实现时落地）：
+- **不用抽屉，用独立路由页面**：与 T1.3/T1.5 的 Sheet 模式不同，TASKS 原文明确要求"创建后跳转到 Agent 详情页"，因此拆成四个路由——`/agents`（列表，`AgentsPage.tsx`）、`/agents/new`（创建，`AgentFormPage.tsx`）、`/agents/:id`（详情，`AgentDetailPage.tsx`）、`/agents/:id/edit`（编辑，同样是 `AgentFormPage.tsx`）；创建/编辑复用同一个表单组件，用 `useParams().id` 是否存在区分模式（跟 McpEditorSheet 单表单复用的思路一致，只是载体从 Sheet 换成路由页面）
+- **`permissionMode` 的产品层可配置粒度**：这是 TECH_DESIGN 8 节遗留的"待确认"项，本任务落地时必须决定。选择直接暴露 Claude Agent SDK 原生的四个取值（`default`/`acceptEdits`/`bypassPermissions`/`plan`），不做额外的产品层封装/简化——v1 用户就是需要精确控制 SDK 行为的开发者/管理员，原样透传语义最直接、后续 T4.3 组装 SDK 参数时也不需要做映射转换。选择器沿用 McpEditorSheet 里"几个固定选项用一组 Button 做分段控件"的既有风格，不新增 shadcn 组件
+- **仓库鉴权凭证的表单交互**：`components/agents/RepositoryListEditor.tsx` 里 `auth_type` 用新增的 shadcn `select` 组件（不是分段 Button——取值语义上更接近"下拉选择一种模式"而不是"来回切换的少数几个选项"，且要跟每行内的凭证输入框在有限宽度里并排布局，Select 比一排 Button 更紧凑）；`auth_credential` 编辑时原样显示后端返回的打码占位符 `********`（不特殊处理，未修改就原样提交回去，后端 `resolve_credential_encrypted` 自动识别并保留旧值，交互逻辑与 T1.5 MCP 表单的 env/headers 完全一致）；新增仓库行、或提交空 URL 的行会在提交前被过滤掉（用户加了行没填写就直接点保存的场景），不强行报错阻塞
+- **新增 shadcn 组件**：`checkbox`（skills/MCP 多选绑定列表）与 `select`（仓库鉴权方式），`pnpm dlx shadcn@latest add checkbox select` 生成，风格与已有组件一致（用 `radix-ui` 统一包，不是逐包安装 `@radix-ui/react-*`）
+- **详情页状态展示只做手动刷新，不做自动轮询/失败重试**：TASKS 原文把"前端轮询或其他方式获取最新状态"和"失败状态下提供重试"明确留给 T2.4；本任务在 `AgentDetailPage.tsx` 只放一个"刷新状态"按钮（手动重新拉取 `GET /agents/{id}`）满足本任务验收标准"创建后能在详情页看到初始化状态"，失败状态目前只展示 `status_message`，还没有重试按钮，留给 T2.4 补上
+- **列表页新增"绑定"列**：复用 `AgentListItem` 已有的 `skill_count`/`mcp_server_count`/`repository_count`，一行文字展示三个计数（跟 T2.1 后端"列表只返回计数不返回明细"的设计对应），完整绑定明细只在详情页展示
+- 验证方式：`pnpm run build`/`pnpm run lint` 通过；本地 `pnpm run dev` + 已在跑的 `backend-api` 容器，用临时装的 Playwright（用完删除，遵循既有规矩）跑了两条链路——① 创建 Agent（填名称、切 `acceptEdits`、改刷新周期、加一个 token 鉴权仓库并填凭证）→ 创建后确认跳转到详情页且状态/权限模式/仓库信息都正确显示 → 编辑页确认凭证字段回显打码占位符 → 只改分支保存 → 详情页确认分支已更新 → 点"刷新状态" → 列表页确认能看到 → 删除清理；② 用 curl 直接建一个临时 MCP Server → 创建 Agent 时勾选它 → 详情页确认"绑定 MCP Servers（1）"且名称正确显示 → 删除 Agent 和临时 MCP Server 清理。两条链路全程浏览器控制台无报错
+
+**决策记录（2026-08-30 交互优化追加）**：用户反馈后做了三处改动，取代上面初版"独立路由页面、SDK 权限模式分段按钮、无能力描述字段"的设计——旧决策里"不用抽屉用独立路由页面"这一条已不再成立，其余（`permissionMode` 直接暴露 SDK 四个取值、仓库鉴权凭证的打码占位符交互、新增 shadcn 组件的做法）仍然有效：
+  - **创建/编辑改回侧边抽屉（Sheet），撤销"独立路由页面"的决策**：删除 `AgentFormPage.tsx`/`AgentDetailPage.tsx` 和 `/agents/new`、`/agents/:id`、`/agents/:id/edit` 三条路由，新增 `components/agents/AgentEditorSheet.tsx`，`App.tsx` 恢复成只有 `/agents` 一条路由（跟 Skill/MCP 一致）。用户明确要求"和 skill 管理一样"，本任务最初因为 TASKS 原文写"创建后跳转到 Agent 详情页"而选了路由方案，这次改动说明"跳转到详情页"这个字面要求本身要让位于"跟其它模块交互一致"的更高优先级——**满足"创建后能看到初始化状态"这条验收标准的方式，不是必须靠路由跳转，抽屉原地切换同样成立**。具体做法完全照搬 `SkillEditorSheet.tsx` 的模式：组件内部维护 `workingId`（初始值等于 props 传入的 `agentId`，创建成功后 `setWorkingId(result.data.id)`），标题栏在 `workingId` 非空时显示状态 Badge + "刷新状态"按钮，创建/保存后都不关闭抽屉（只重置 `saveMessage` 提示"已创建"/"已保存"），用户主动点右上角关闭按钮或按 Escape 才关闭；抽屉每次打开仍然靠 `AgentsPage.tsx` 里 `key={editingId-openSeq}` 强制整体重新挂载拿到干净状态（同 Skill/MCP 列表页模式）
+  - **新增"能力描述"字段**：这是本任务范围外的新需求，牵动了后端——`agents` 表加 `description`（Text，nullable）列（Alembic 迁移 `dbf10ea831f1_agent_description.py`，`uv run alembic revision --autogenerate` 生成，本地用 `uv run alembic upgrade head` + 重建 `backend-api` 镜像应用），`AgentCreateRequest`/`AgentListItem`/`AgentDetail` 三个 schema 加字段，`create_agent`/`update_agent` service 函数签名加 `description` 参数。列表页也展示描述（截断成一行），跟 Skill/MCP 列表"只要轻量元信息"不完全一样——因为能力描述本身就是给管理员快速识别一堆 Agent 用途的关键信息，值得在列表页就露出，不是要点开才能看到的细节
+  - **skills/MCP 绑定改成可过滤的穿梭器（Transfer List）**，取代原来的纯 Checkbox 竖直列表：新增 `components/agents/TransferList.tsx`（v1 自研，shadcn 没有对应组件），左侧是全量列表（搜索框 + "全选"复选框 + 当前筛选命中的项数），右侧是已选列表（"清除"按钮清空全部 + 已选计数，每项 hover 出现 × 单独移除）。选择"自研而非引入第三方穿梭器库"的原因：需求本身不复杂（单一层级、无拖拽排序要求），且要跟项目现有 Tailwind + shadcn 基础组件（`Checkbox`/`Input`）风格保持一致，引入专门的 Transfer 组件库反而要处理样式覆盖问题；这个组件跟 Skill/MCP 无关的选择集合都能复用（纯 `{id, label}[]` + 受控 `value`/`onChange`），不绑定 Agent 模块的具体类型
+  - 验证方式：本地 `pnpm run build`/`pnpm run lint` 通过；后端改动 `uv run pytest`（18 个用例全过，`test_agents.py` 原有用例因为 `description` 是可选字段未受影响）+ `docker compose build/up backend-api` 重建镜像应用迁移；前端用临时装的 Playwright（用完删除）跑了一条完整链路：点"新建 Agent"确认抽屉打开且 URL 仍是 `/agents`（不是 `/agents/new`）→ 填名称+能力描述 → 在 MCP 穿梭器里搜索关键字过滤出目标项并勾选，确认右侧"已选 1 项"→ 提交创建 → 确认抽屉原地切换成编辑态（标题变成 Agent 名称、出现状态 Badge、"刷新状态"/"删除 Agent"按钮），能力描述和 MCP 绑定都保留 → 按 Escape 关闭 → 列表页确认新 Agent 出现且描述摘要正确显示、绑定计数显示"1 MCP"→ 重新点开确认穿梭器里 MCP 项仍是已选状态、能力描述字段正确回显 → 删除清理。全程浏览器控制台无报错
 
 ---
 

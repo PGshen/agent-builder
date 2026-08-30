@@ -31,6 +31,7 @@ class AgentRepositoryDetail(BaseModel):
 
 class AgentCreateRequest(BaseModel):
     name: str = Field(min_length=1)
+    description: str | None = None
     permission_mode: str = "default"
     repo_refresh_interval_minutes: int = Field(default=30, ge=1)
     skill_ids: list[UUID] = Field(default_factory=list)
@@ -61,6 +62,7 @@ class AgentListItem(BaseModel):
 
     id: UUID
     name: str
+    description: str | None
     status: str
     permission_mode: str
     repo_refresh_interval_minutes: int
@@ -75,6 +77,7 @@ class AgentDetail(BaseModel):
 
     id: UUID
     name: str
+    description: str | None
     workspace_id: str
     permission_mode: str
     repo_refresh_interval_minutes: int

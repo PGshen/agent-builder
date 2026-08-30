@@ -16,6 +16,8 @@ class Agent(Base, UUIDPKMixin, TimestampMixin):
     __tablename__ = "agents"
 
     name: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
+    # 该 Agent 的能力描述（用途、擅长什么），纯展示用途，不参与 SDK 调用组装
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
     # workspace 的唯一标识，供 MinIO 快照 object key 前缀 / Runner 本地缓存目录命名使用；
     # 独立生成（不直接复用 id），保持"内部主键"与"对外可见的 workspace 标识"解耦
     workspace_id: Mapped[str] = mapped_column(

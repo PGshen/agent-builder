@@ -156,6 +156,7 @@ async def create_agent(
     db: AsyncSession,
     *,
     name: str,
+    description: str | None,
     permission_mode: str,
     repo_refresh_interval_minutes: int,
     skill_ids: list[uuid.UUID],
@@ -166,6 +167,7 @@ async def create_agent(
 
     agent = Agent(
         name=name,
+        description=description,
         permission_mode=permission_mode,
         repo_refresh_interval_minutes=repo_refresh_interval_minutes,
         status="initializing",
@@ -208,6 +210,7 @@ async def update_agent(
     agent_id: uuid.UUID,
     *,
     name: str,
+    description: str | None,
     permission_mode: str,
     repo_refresh_interval_minutes: int,
     skill_ids: list[uuid.UUID],
@@ -225,6 +228,7 @@ async def update_agent(
     }
 
     agent.name = name
+    agent.description = description
     agent.permission_mode = permission_mode
     agent.repo_refresh_interval_minutes = repo_refresh_interval_minutes
 

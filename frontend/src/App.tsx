@@ -4,7 +4,7 @@ import { RequireAuth } from './layout/RequireAuth'
 import { LoginPage } from './pages/LoginPage'
 import { SkillsPage } from './pages/SkillsPage'
 import { McpPage } from './pages/McpPage'
-import { AgentBuilderPage } from './pages/AgentBuilderPage'
+import { AgentsPage } from './pages/AgentsPage'
 import { ConversationPage } from './pages/ConversationPage'
 
 export default function App() {
@@ -21,7 +21,7 @@ export default function App() {
         <Route index element={<Navigate to="/skills" replace />} />
         <Route path="skills" element={<SkillsPage />} />
         <Route path="mcp" element={<McpPage />} />
-        <Route path="agents" element={<AgentBuilderPage />} />
+        <Route path="agents" element={<AgentsPage />} />
         <Route path="conversations" element={<ConversationPage />} />
       </Route>
     </Routes>

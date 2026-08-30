@@ -26,6 +26,7 @@ def _to_list_item(entry: AgentListEntry) -> AgentListItem:
     return AgentListItem(
         id=entry.agent.id,
         name=entry.agent.name,
+        description=entry.agent.description,
         status=entry.agent.status,
         permission_mode=entry.agent.permission_mode,
         repo_refresh_interval_minutes=entry.agent.repo_refresh_interval_minutes,
@@ -42,6 +43,7 @@ def _to_detail(
     return AgentDetail(
         id=agent.id,
         name=agent.name,
+        description=agent.description,
         workspace_id=agent.workspace_id,
         permission_mode=agent.permission_mode,
         repo_refresh_interval_minutes=agent.repo_refresh_interval_minutes,
@@ -78,6 +80,7 @@ async def create_agent(body: AgentCreateRequest, db: AsyncSession = Depends(get_
         agent = await service.create_agent(
             db,
             name=body.name.strip(),
+            description=(body.description.strip() or None) if body.description else None,
             permission_mode=body.permission_mode,
             repo_refresh_interval_minutes=body.repo_refresh_interval_minutes,
             skill_ids=body.skill_ids,
@@ -111,6 +114,7 @@ async def update_agent(
             db,
             agent_id,
             name=body.name.strip(),
+            description=(body.description.strip() or None) if body.description else None,
             permission_mode=body.permission_mode,
             repo_refresh_interval_minutes=body.repo_refresh_interval_minutes,
             skill_ids=body.skill_ids,
