@@ -48,9 +48,11 @@ async def get_skill(skill_id: UUID, db: AsyncSession = Depends(get_db_session)) 
         id=skill.id,
         name=skill.name,
         version=skill.version,
+        active_version=skill.active_version,
         status=skill.status,
         updated_at=skill.updated_at,
         files=files,
+        versions=skill.versions,
     )
 
 
@@ -66,6 +68,21 @@ async def update_skill(
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Skill 不存在") from exc
     except SkillValidationError as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    return SkillListItem.model_validate(skill)
+
+
+@router.post("/{skill_id}/versions/{version}/activate", response_model=SkillListItem)
+async def activate_skill_version(
+    skill_id: UUID,
+    version: int,
+    db: AsyncSession = Depends(get_db_session),
+) -> SkillListItem:
+    try:
+        skill = await service.activate_version(db, skill_id, version=version)
+    except service.SkillNotFoundError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Skill 不存在") from exc
+    except service.SkillVersionNotFoundError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     return SkillListItem.model_validate(skill)
 
 

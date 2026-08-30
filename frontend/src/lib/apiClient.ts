@@ -14,7 +14,9 @@ export interface ApiResult<T> {
  */
 export async function apiRequest<T>(path: string, init?: RequestInit): Promise<ApiResult<T>> {
   const headers = new Headers(init?.headers)
-  if (init?.body && !headers.has('Content-Type')) {
+  // FormData 请求（文件上传）不手动设 Content-Type：浏览器需要自己生成带 boundary 的
+  // multipart/form-data 头，手动设置反而会丢掉 boundary 导致后端解析不出表单字段
+  if (init?.body && !(init.body instanceof FormData) && !headers.has('Content-Type')) {
     headers.set('Content-Type', 'application/json')
   }
   const token = getAuthToken()
@@ -36,6 +38,10 @@ export const apiClient = {
   get: <T,>(path: string) => apiRequest<T>(path, { method: 'GET' }),
   post: <T,>(path: string, body?: unknown) =>
     apiRequest<T>(path, { method: 'POST', body: body !== undefined ? JSON.stringify(body) : undefined }),
+  put: <T,>(path: string, body?: unknown) =>
+    apiRequest<T>(path, { method: 'PUT', body: body !== undefined ? JSON.stringify(body) : undefined }),
+  delete: <T,>(path: string) => apiRequest<T>(path, { method: 'DELETE' }),
+  postForm: <T,>(path: string, form: FormData) => apiRequest<T>(path, { method: 'POST', body: form }),
 }
 
 export interface HealthResponse {

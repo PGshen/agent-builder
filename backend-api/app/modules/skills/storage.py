@@ -1,4 +1,5 @@
-"""Skill zip 包的打包/解包/校验，以及与 MinIO 的存取（一个 Skill 对应一个 zip 对象）。
+"""Skill zip 包的打包/解包/校验，以及与 MinIO 的存取（一个 Skill 版本对应一个 zip 对象，
+保留历史版本，不覆盖旧对象）。
 
 MinIO 客户端沿用 agent-runner 已验证过的模式：官方 `minio` SDK 是同步客户端，
 用 `asyncio.to_thread` 包一层给 async 代码用，不引入额外的异步 S3 客户端依赖。
@@ -36,10 +37,9 @@ def get_minio_client() -> Minio:
     return _client
 
 
-def _object_key(skill_id: uuid.UUID) -> str:
-    # 同一个 Skill 的 zip 对象固定用这个 key，保存时整体覆盖，不按版本号生成新 key
-    # （版本号只是 Postgres 里的元数据字段）
-    return f"{skill_id}.zip"
+def _object_key(skill_id: uuid.UUID, version: int) -> str:
+    # 每个版本单独一个 key，保存时新增对象而不是覆盖旧的，历史版本因此可以一直保留
+    return f"{skill_id}/v{version}.zip"
 
 
 def _validate_path(path: str) -> None:
@@ -120,8 +120,8 @@ def _remove_object_sync(object_key: str) -> None:
     client.remove_object(settings.minio_bucket_skills, object_key)
 
 
-async def put_skill_zip(skill_id: uuid.UUID, data: bytes) -> str:
-    object_key = _object_key(skill_id)
+async def put_skill_zip(skill_id: uuid.UUID, version: int, data: bytes) -> str:
+    object_key = _object_key(skill_id, version)
     await asyncio.to_thread(_put_object_sync, object_key, data)
     return object_key
 

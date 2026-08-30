@@ -157,17 +157,18 @@
 - 一个 Skill 对应 MinIO 里一个 zip 对象；Postgres 只存元数据（名称、对象 key、版本、状态），不维护文件级索引
 - 编辑接口：拉取现有 zip 解压，返回可编辑的文件树结构给前端；保存接口：接收改动后的内容，重新打包整体覆盖上传
 - zip 内目录结构遵循标准 skill 规范（`SKILL.md` + 资源文件），创建时校验基本结构是否符合规范
-- 版本号每次保存递增，用于后续 Agent 绑定关系里判断是否需要提示"有更新"（v1 不做自动推送，只是元数据层面的版本记录）
+- 版本号每次保存递增，用于后续 Agent 绑定关系里判断是否需要提示"有更新"（v1 不做自动推送，只是元数据层面的版本记录）；保存历史版本而非覆盖更新，支持回滚到任意历史版本（2026-08-30 追加，见下方决策记录）
 
 **验收标准**：
 - 创建 Skill 时上传符合规范的内容，能在 MinIO 里看到对应 zip 对象生成
-- 编辑并保存后，MinIO 对象被覆盖更新，版本号递增，Postgres 元数据同步更新
+- 编辑并保存后，MinIO 里新增一个版本对象（旧版本对象不受影响），版本号递增，Postgres 元数据同步更新
 - 上传不符合规范（缺 `SKILL.md` 等）的内容时，接口能明确拒绝并返回原因
-- 删除 Skill 后，MinIO 对象与 Postgres 元数据一并清理
+- 能查看某个 Skill 的历史版本列表，并把任意历史版本重新设为当前激活版本（回滚）
+- 删除 Skill 后，其所有版本的 MinIO 对象与 Postgres 元数据一并清理
 
 **决策记录**（实现时落地）：
 - 创建接口（`POST /skills`）与编辑/保存接口（`PUT /skills/{id}`）用了两种不同的输入形式，均对应 TASKS 原文语义：创建接口接收 `multipart/form-data`（`name` 字段 + zip 文件），原样存 MinIO，不解包；编辑接口先用 `GET /skills/{id}` 把 zip 解压成 `{路径: 文本内容}` 的文件树 JSON 返给前端，保存时 `PUT /skills/{id}` 接收同样结构的 JSON（不是 zip），后端重新打包整体覆盖上传——直接对应 TASKS 原文"编辑接口拉取现有 zip 解压返回文件树""保存接口接收改动后的内容重新打包"的两句表述
-- MinIO 对象 key 固定为 `{skill_id}.zip`，每次保存原地覆盖，不按版本号生成新 key；版本号只是 Postgres `skills.version` 字段的计数器，不体现在对象存储路径里
+- ~~MinIO 对象 key 固定为 `{skill_id}.zip`，每次保存原地覆盖~~——2026-08-30 改成保留历史版本，不再覆盖，见下方决策记录
 - v1 只支持 UTF-8 文本文件（`SKILL.md` + 脚本等），不支持二进制资源文件：解压时按 UTF-8 解码，解码失败直接判为不合法内容拒绝。原因：文件树用 JSON 传输本身不适合塞二进制，真要支持二进制资源留到后续需要时再加 base64 编码的分支，v1 不做
 - 校验规则（`app/modules/skills/storage.py::validate_files`）：内容非空、必须包含根路径下的 `SKILL.md`、路径不能是绝对路径或包含 `..`（防 zip slip）；创建（解压上传的 zip）和保存（前端传回的文件树）复用同一套校验函数，保证两个入口标准一致
 - 路径分隔符统一归一化成 `/`：实测发现 Windows `PowerShell Compress-Archive` 生成的 zip 条目会用 `\` 而不是 zip 标准的 `/`，解压时统一 `.replace("\\", "/")`，否则同一路径在文件树里可能表现成两种形式、重新打包出的 zip 也不规范
@@ -176,6 +177,14 @@
 - 敏感字段/鉴权头依赖：`app/api/deps.py` 新增 `get_db_session`（FastAPI 依赖项，包一层 `async with session_factory() as session`），Skill router 整体挂 `Depends(get_current_admin)`，T1.1 交接记录里提到的"补依赖项""业务路由记得接鉴权"两件事在本任务落地
 - **顺带修了 T0.2 一个潜在 bug**：`app/db.py` 的 `dispose_engine()` 之前只清空 `_engine` 全局单例，没有同步清空 `_session_factory`（`_session_factory` 是绑定着旧 engine 创建的缓存实例）。生产环境单进程单 event loop 从不触发这个问题，但本任务写多用例的 pytest（`asyncio_mode=auto`，每个测试函数一个新 event loop）时稳定复现：`dispose_engine()` 之后下一个测试仍会拿到绑定旧 engine/旧 loop 的 `_session_factory`，导致该测试内的数据库操作报 `RuntimeError: Event loop is closed`。已修复为 `dispose_engine()` 同时清空两个全局变量；`tests/conftest.py` 相应新增 `_reset_db_engine_per_test` autouse fixture（模式与 T0.5 的 Redis 客户端重置 fixture 一致）
 
+**决策记录（2026-08-30 覆盖更新改为版本历史）**：用户直接反馈"现在是覆盖更新还是保存历史版本"，要求改成保存历史版本，且明确"不用加表，直接在现有表增加两个字段"。改动如下：
+  - **不新增表，在 `skills` 表加两个字段**：`active_version`（Integer，当前生效/激活的版本号）、`versions`（JSONB，版本历史记录数组，每条 `{"version": int, "object_key": str, "created_at": iso8601}`，只追加不删除）。原有的 `version` 字段语义调整为"历史上创建过的最新版本号，只增不减"（正常保存时 `version == active_version`，回滚到旧版本后 `active_version < version`）；`object_key` 字段保留，但语义变成"冗余存一份当前激活版本的 object key"，跟 `active_version` 保持同步，这样读内容时不用现解析 `versions` JSON 数组
+  - **MinIO key 从固定改成按版本区分**：`{skill_id}/v{version}.zip`，保存（`PUT`）不再覆盖旧对象，而是上传一个新版本对象、把新条目追加进 `versions`、`active_version`/`object_key`/`version` 都指向新版本。历史版本的旧对象永久保留，v1 不做过期清理/存储配额限制
+  - **回滚是移动指针，不是新建版本**：新增 `POST /skills/{id}/versions/{version}/activate` 接口，只把 `active_version`/`object_key` 指向历史条目里已经存在的那个版本，`versions` 列表和 `version` 计数器都不变——这样"回滚后再编辑保存"产生的新版本号是接着 `version` 计数器往下走（比如从 v3 回滚到 v1 后编辑保存，新版本是 v4 而不是 v2），版本号历史不会因为回滚被覆盖或复用，语义上更像 git 的"检出旧 commit 再往前走"而不是"删掉后面的历史"
+  - **旧数据的迁移**：Alembic 迁移（`d9597aafe1c9_skill_version_history.py`）加列时用 `server_default` 让已有行先有值满足 NOT NULL，再用一条 `UPDATE ... SET active_version = version, versions = jsonb_build_array(...)` 把老数据的"当前状态"回填成 `versions` 列表里唯一的一条记录——因为旧版本代码是覆盖更新，物理上从来没有保留过之前的版本内容，所以老 Skill 的历史只能从"迁移那一刻的状态"开始，这是数据层面的硬限制，不是迁移脚本的疏漏
+  - **前端**：`SkillEditorSheet.tsx` 头部新增一个"历史版本"图标按钮（`lucide-react` 的 `History`，新增 shadcn `dropdown-menu` 组件），点开是版本列表（新到旧排序，当前激活的标"当前"且禁用点击），点某个历史版本即调用 activate 接口并重新整体拉取详情（`loadDetail` helper，同时更新 `meta`/`files`/`versions`，被创建/保存/回滚三处复用）；版本徽章从"只显示 `v{version}`"改成"`v{active_version}` + 不等于 `version` 时额外显示`最新 v{version}`"，列表页表格同样处理
+  - 验证方式：`uv run pytest` 扩充了 `test_skills.py` 的闭环用例（保存两次产生 v2/v3 → `versions` 列表有 3 条 → 回滚到 v1 内容和 `active_version` 都正确 → 回滚到不存在的版本号返回 404 → 重新激活 v2 恢复）；前端另外用临时 Playwright 跑了一遍"创建 v1 → 连续编辑保存到 v3 → 历史版本下拉里能看到三个版本 → 回滚 v1 且内容/徽章都正确 → 关闭抽屉重开列表页显示`v1（最新 v3）`→ 重新打开抽屉切回 v3 再编辑保存 → 确认新版本号是 v4 而不是 v2（验证回滚不影响版本计数器）→ 删除清理"；测试过程中发现"点完历史版本下拉菜单项后立刻按 Escape 关不掉抽屉"的现象，定位是 Radix 的嵌套 dismissable layer 时序问题（DropdownMenu 刚关闭时自己的 layer 还没从栈里退出，Escape 被它"吃掉"没传到 Sheet），不是本次改动引入的代码问题，真实用户操作节奏下基本不会撞见，未做额外处理
+
 ---
 
 ### T1.3 Skill 管理前端页面
@@ -183,12 +192,33 @@
 
 **关键实现决策**：
 - 列表页展示所有 Skill（名称、版本、状态、更新时间）
-- 详情/编辑页能浏览 zip 内的文件树、查看和编辑文件内容，保存时调用 T1.2 的保存接口
+- 新建/编辑用侧边抽屉（Sheet）承载，不做独立路由页面——列表页保持挂载，抽屉内完成创建/编辑全流程（2026-08-30 交互优化后的决策，见下方决策记录）
+- 详情/编辑页能浏览 zip 内的**嵌套目录树**、查看和编辑文件内容，保存时调用 T1.2 的保存接口；树上支持文件/目录的新建、删除、移动（拖拽或重命名路径）
 - 创建页支持新建 Skill（上传或从模板创建，二选一在本任务定，若上传则前端本地打包成 zip 提交）
 
 **验收标准**：
 - 能在页面上完成"新建 Skill → 查看文件内容 → 编辑保存 → 列表看到版本更新"的完整闭环操作
 - 编辑保存失败（如格式校验不通过）时页面有明确提示，不会静默失败
+
+**决策记录**（实现时落地）：
+- 创建页选了"从模板创建"，不做"选择本地 zip 文件上传"：填 名称+描述 两个字段，前端按 skill 规范生成一份最小 `SKILL.md`（`skillsApi.ts::buildSkillTemplate`），用 `fflate`（新增前端依赖，~8KB，零依赖，`zipSync` 同步打包）在浏览器里打包成 zip，走和"上传"同一条 `POST /skills`（multipart）创建接口；创建成功后**原地**（同一个抽屉）切换成编辑态，用户可以继续加文件、改内容，不需要跳转/关闭再打开
+- 保存请求发送完整的 `files` map（不是 diff/patch）：跟 T1.2 后端"整体重新打包覆盖上传"的语义对应，前端不需要维护一份"哪些文件被改动过"的脏检查逻辑
+- 删除确认、单文件/目录删除确认都用浏览器原生 `window.confirm()`，没有引入 shadcn 的 dialog 组件：v1 只是需要一个"确定/取消"的阻断确认，原生 API 够用，不为此新增一个组件依赖
+- `apiClient.ts` 补了 `put`/`delete`/`postForm` 三个方法；`apiRequest` 原有的"有 body 就默认设 `Content-Type: application/json`"逻辑改成排除 `FormData`——文件上传要让浏览器自己生成带 boundary 的 multipart 头，这是本任务在联调时验证到的必要修正，不是预先设计好的
+- 手工验证方式：本地 `pnpm run dev` 起 dev server，用临时装的 Playwright（用完删除，未进仓库，遵循 T0.5 交接记录里定下的规矩）跑了一遍完整闭环：登录 → 新建（模板创建）→ 详情页确认 `SKILL.md` 内容含预期文本 → 加一个 `scripts/run.py` 文件并编辑内容 → 保存确认版本号 v1→v2 → 返回列表确认版本号已更新 → 删除 `SKILL.md` 再保存，确认页面原样展示后端"缺少 SKILL.md"的错误提示且不跳转 → 删除整个 Skill，确认从列表消失
+
+**决策记录（2026-08-30 交互优化追加）**：用户反馈后做了三处改动，取代上面"创建页/编辑页各自独立路由、文件树是扁平列表"的初版设计——旧决策里"创建后跳转到详情/编辑页""扁平列表"两条已不再成立，其余（模板创建、files 整体提交、原生 confirm、apiClient 的 FormData 修正）仍然有效：
+  - **新建/编辑不再是独立路由页面，改成侧边抽屉（shadcn `Sheet`）**：新增 `components/skills/SkillEditorSheet.tsx`，`SkillsPage.tsx` 里维护 `sheetOpen`/`editingId` 两个 state 控制抽屉，不再有 `/skills/new`、`/skills/:id` 路由（`SkillCreatePage.tsx`/`SkillDetailPage.tsx` 已删除）。抽屉内部分两个阶段：未创建时是"名称+描述"表单，创建成功后原地切到"文件树+编辑器"视图，这个切换逻辑复用同一个组件而不是新建/编辑各自一个组件，因为两者除了"要不要先有一个创建表单步骤"之外，UI 完全一致
+  - **抽屉每次打开都要有干净的状态**（不能沿用上次打开时的残留编辑内容）：没有在 `useEffect` 里手动重置一堆 `useState`（那样会触发 oxlint 的 `set-state-in-effect` 警告，本质也确实是反模式），改用 React 官方推荐的"用 `key` 强制重新挂载"方案——`SkillsPage.tsx` 维护一个 `openSeq` 计数器，每次点新建/编辑就 `+1`，`<SkillEditorSheet key={`${editingId ?? 'create'}-${openSeq}`} .../>`，key 变化即重新挂载，组件内部只需要正常的 `useState` 初始值，不需要额外的重置逻辑
+  - **文件树从扁平列表改成真正的嵌套目录树**：新增 `lib/fileTree.ts`（纯函数：`buildFileTree` 把 `{路径: 内容}` 建成嵌套 `dir`/`file` 节点树；`renameFile`/`renameDir`/`deleteFile`/`deleteDir`/`addFile` 是操作这个 flat map 的纯函数）+ `components/skills/SkillFileTree.tsx`（递归渲染，目录可折叠/展开）。目录在数据模型里依然不是独立实体——纯粹是文件路径前缀的推导结果，一个目录底下一个文件都没有就不存在于树里，所以**不提供"新建空文件夹"操作**，只提供"在某个目录下新建文件"（文件名可以带 `/` 隐式建出子目录）
+  - **树上的新建/删除/移动**：每一行 hover 后露出操作按钮（文件：重命名/移动、删除；目录：新建文件、重命名/移动、删除）。"重命名/移动"统一实现成编辑该节点的**完整路径**（不只是叶子名）——文件改路径前缀就是移动到别的目录，目录改路径前缀会把它下面所有文件的路径一起替换，这样"移动"不需要额外发明一套 API，复用同一个"改路径"操作即可。另外用原生 HTML5 拖放（`draggable` + `dragstart`/`dragover`/`drop`，没引入拖放库）实现"拖到目标目录即移动"，和"重命名路径"是两条互补的移动方式；根目录本身也是一个可见的伪节点（带"新建文件"按钮和拖放目标），否则没有入口能在根目录下新建文件
+  - **编辑器高度溢出改为内部滚动**：`SheetContent` 用 `flex flex-col`，文件树区域和编辑器区域各自套一层 `min-h-0 overflow-y-auto`，让抽屉整体高度锁定在视口内、内容超长时只在各自的滚动容器里滚动，而不是把整个抽屉/页面撑高；`Textarea` 组件默认的 `field-sizing: content`（内容多高就撑多高，shadcn 默认行为）会破坏这个布局，本任务用内联 `style={{ fieldSizing: 'fixed' }}` 显式覆盖（没走 `className`，因为 `tailwind-merge` 不一定认识 `field-sizing-*` 这种较新的 Tailwind v4 工具类，走内联样式更保险，不依赖 class 去重是否生效）
+  - 验证方式同样是临时装 Playwright（用完删除）跑自动化：登录 → 点"新建 Skill"确认抽屉打开且 URL 仍停在 `/skills`（不是跳转新路由）→ 创建后抽屉原地切换成编辑态 → 用根目录"+"新建 `docs/readme.md`（验证嵌套目录靠路径里的 `/` 隐式产生）→ 再建一个根级 `notes.md` 并通过派发原生 `DragEvent` 拖进 `docs/` 目录（验证拖拽移动，`docs/notes.md`）→ 对 `docs` 目录执行"重命名/移动"改成 `documentation`（验证目录改名连带移动其下所有文件，`documentation/readme.md`+`documentation/notes.md`）→ 往编辑器里填极长内容，断言 `textarea.scrollHeight > clientHeight` 且 `overflow-y: auto`，同时断言 `SheetContent` 的高度没有超出视口（验证"内部滚动"而不是"撑高整个抽屉"）→ 保存看版本号变化 → 树上删除单个文件 → 按 Escape 关闭抽屉确认 URL 仍是 `/skills` 且列表已刷新 → 重新打开该 Skill 并整体删除
+
+**决策记录（2026-08-30 二次交互优化追加）**：用户看到实际效果后又提了两点：
+  - **抽屉宽度改成视口的 85%**：`SheetContent` 基础组件的 `data-[side=right]:sm:max-w-sm` 带了属性选择器，特异性比普通 `sm:max-w-*` 工具类高，之前用 `className="sm:max-w-4xl"` 覆盖其实没生效（截图证实抽屉还是默认的 `max-w-sm` 宽度）；改用内联 `style={{ width: '85vw', maxWidth: '85vw' }}` 强制生效，不再依赖 className 的特异性/合并规则
+  - **支持在树上新建目录**（不只是靠文件路径带 `/` 隐式建目录）：目录在数据模型里依然不是独立实体（没有改 T1.2 的后端 schema），新建目录时在 `lib/fileTree.ts` 里新增的 `DIR_PLACEHOLDER_FILE = '.gitkeep'` 常量指定的占位文件会被放进这个新目录（如新建 `assets` 目录实际创建的是 `assets/.gitkeep`，空内容），这样目录在保存前后都真实存在于 `files` map 里，不会因为"目录下没有文件"而在下次渲染时消失；`SkillFileTree.tsx` 里 `startCreate`/`commitCreate` 加了 `kind: 'file' | 'dir'` 参数区分两种新建，UI 上根目录和每个目录节点的 hover 操作里"新建文件"（`FilePlus`）旁边加了"新建目录"（`FolderPlus`）按钮。用户后续如果往这个目录里加了真正的文件，`.gitkeep` 依然会留在那里（v1 没有做"目录不再为空时自动清理占位文件"这个便利功能，用户需要时可以手动在树上删除它）
+  - 验证方式：Playwright 跑了"新建 Skill → 断言抽屉宽度是视口宽度的 85%（`sheetWidth / viewportWidth` 落在 0.8~0.9 之间）→ 根目录新建目录 `assets`（断言树上出现 `assets` 和它下面的 `.gitkeep`）→ 在 `assets` 下再新建嵌套目录 `icons` → 保存 → 关闭抽屉重新打开（真正从后端 `GET /skills/{id}` 拉一遍，不是看本地未提交的临时状态）→ 断言 `assets`/`icons` 两层空目录都还在 → 删除测试 Skill 收尾"的完整链路
 
 ---
 

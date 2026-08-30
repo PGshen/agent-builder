@@ -74,6 +74,7 @@ async def test_create_list_edit_save_delete_skill_lifecycle():
         created = create_response.json()
         assert created["name"] == name
         assert created["version"] == 1
+        assert created["active_version"] == 1
         skill_id = created["id"]
 
         list_response = await client.get("/skills", headers=headers)
@@ -94,9 +95,30 @@ async def test_create_list_edit_save_delete_skill_lifecycle():
         assert update_response.status_code == 200
         updated = update_response.json()
         assert updated["version"] == 2
+        assert updated["active_version"] == 2
 
         detail_after_update = await client.get(f"/skills/{skill_id}", headers=headers)
-        assert detail_after_update.json()["files"]["scripts/run.py"] == "print('edited')\n"
+        detail_after_update_body = detail_after_update.json()
+        assert detail_after_update_body["files"]["scripts/run.py"] == "print('edited')\n"
+        # 保存是新增版本，不是覆盖：旧版本的记录还在，且能各自拿到不同内容
+        assert [v["version"] for v in detail_after_update_body["versions"]] == [1, 2]
+
+        rollback_response = await client.post(f"/skills/{skill_id}/versions/1/activate", headers=headers)
+        assert rollback_response.status_code == 200
+        rolled_back = rollback_response.json()
+        assert rolled_back["active_version"] == 1
+        assert rolled_back["version"] == 2  # 历史上创建过的最新版本号不因回滚而改变
+
+        detail_after_rollback = await client.get(f"/skills/{skill_id}", headers=headers)
+        assert detail_after_rollback.json()["files"]["scripts/run.py"] == "print('hello')\n"
+
+        activate_missing_version = await client.post(
+            f"/skills/{skill_id}/versions/99/activate", headers=headers
+        )
+        assert activate_missing_version.status_code == 404
+
+        restore_latest = await client.post(f"/skills/{skill_id}/versions/2/activate", headers=headers)
+        assert restore_latest.json()["active_version"] == 2
 
         update_missing_manifest = await client.put(
             f"/skills/{skill_id}", json={"files": {"scripts/run.py": "x = 1\n"}}, headers=headers
