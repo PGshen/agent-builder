@@ -234,6 +234,16 @@
 - 能创建、编辑、删除 MCP Server 配置，字段校验完整（缺必填字段时拒绝）
 - 敏感字段在列表/详情接口返回时不会明文暴露（如做脱敏展示）
 
+**决策记录**（实现时落地）：
+- **配置结构**：对齐 SDK `mcpServers` 里常见的三种 server 类型，用 Pydantic 判别联合（`type` 字段区分）落地在 `app/modules/mcp/schemas.py`：`stdio`（`command`/`args`/`env`）、`sse`（`url`/`headers`）、`http`（`url`/`headers`）。必填字段（如 `command`、`url`）缺失时 Pydantic 直接 422，不需要手写校验逻辑
+- **敏感字段加密方式**：不是"挑几个字段名加密"，而是把整份 `config` 当成一个整体，用 Fernet（对称加密，`cryptography` 库）加密后存成 `mcp_servers.config_encrypted`（Text 列，替换掉原来的 `config` JSONB 列）；密钥来自新增配置项 `MCP_ENCRYPTION_KEY`（`.env`，Fernet urlsafe base64 格式）。选整体加密而非"只加密 env/headers 的 value"是因为后者需要在存储层就感知 config 的内部结构（type 判别），加重了存储层复杂度，而整体加密+应用层脱敏可以让存储层完全不关心 config 内部长什么样
+- **脱敏展示**：只对约定的两个 dict 字段（`env`、`headers`）的 **value** 打码（固定占位符 `"********"`，`app/modules/mcp/masking.py::mask_config`），**key 不打码**——这样用户在编辑表单里能看到"这个 stdio server 配置了哪些环境变量名"而不需要盲改，只有要更新某个 value 时才需要重新输入。`command`/`args`/`url` 等非密钥字段不脱敏，直接明文返回（这些字段本身不是密钥）
+- **编辑时的"未修改字段保留原值"语义**：`PUT /mcp/{id}` 要求整体提交完整 `config`（跟 Skill 保存整体覆盖的模式一致），如果某个 env/header 的 value 原样是占位符 `"********"`（说明用户没有重新输入），后端 `merge_secret_fields`（`masking.py`）会把它替换回解密后的旧值再重新加密存储；如果 value 不是占位符（用户输入了新内容），则视为真正的新值直接采用。这个逻辑跟 T1.5 前端"表单展示脱敏值，重新输入才更新"的交互直接对应
+- **不做真实的"测试连接"能力**：TASKS 原文允许"若实现复杂可先跳过"——stdio 类型需要真的起子进程握手、sse/http 需要实际网络请求且要正确处理各种鉴权方式，复杂度和收益不成比例，v1 跳过，留作后续需要时再加
+- **status 字段**：延用 T1.1 建表时就有的 `status`（字符串，默认 `"active"`），`PUT` 更新时可以一并传，没有做成独立的"启用/禁用"专用接口，因为改状态和改配置在前端表单里本来就是同一次提交
+- 迁移：`4a51fbaabd44_mcp_server_encrypted_config.py`（`autogenerate` 生成，`mcp_servers` 表加 `config_encrypted` 列、删掉 `config` 列）。落地时表里还没有真实数据（T1.4 之前没人写过 MCP 配置），所以 `config_encrypted` 直接 `nullable=False` 且没有做数据回填分支，跟 T1.2 那种"已有数据需要回填"的迁移不是一回事
+- 验证方式：`uv run pytest`（新增 `tests/test_mcp.py` 4 个用例，覆盖鉴权拦截、缺字段 422、stdio 全生命周期含 env 打码/回填/真正更新、http 类型 headers 脱敏 + 重名 409）；另外 `docker compose build/up backend-api` 重建镜像后用 `curl` 走了一遍真实容器的创建 → 列表 → 详情 → 删除，确认 `env.API_KEY` 在所有返回里都是 `********`
+
 ---
 
 ### T1.5 MCP 管理前端页面
@@ -245,6 +255,15 @@
 
 **验收标准**：
 - 能在页面上完成 MCP 配置的新建、编辑、删除，且敏感字段不会明文回显
+
+**决策记录**（实现时落地）：
+- **单表单，不做两阶段流程**：跟 T1.3 Skill 的"创建后原地切编辑态"不一样，MCP 配置没有文件树那种复杂度，新建/编辑复用同一个表单组件（`components/mcp/McpEditorSheet.tsx`），字段随用户选的 `type`（stdio/sse/http）联动显示——不需要先建后编的两阶段设计
+- **类型/状态选择器不引入新 shadcn 组件**：只有三个固定的 type 选项和两个固定的 status 选项，用一组 `Button`（`variant` 在选中态是 `default`、非选中态是 `outline`）做成简易分段控件，没有为此新增 Select/RadioGroup 组件依赖，跟 T1.3"能用原生能力就不引入新组件"的一贯风格一致
+- **env/headers 用通用的 key-value 编辑器**：新增 `components/mcp/KeyValueEditor.tsx`（纯 UI，一行一个 key/value 输入框 + 删除按钮 + 底部"添加"按钮），配套的 `pairsToRecord`/`recordToPairs` 两个纯函数放进 `lib/keyValuePairs.ts`（而不是和组件放一个文件），避免触发 oxlint 的 `only-export-components` 警告——这两个字段在 stdio（env）和 sse/http（headers）里结构一样，共用同一个编辑器组件
+- **脱敏字段的编辑语义完全交给后端**：前端不需要专门判断"这个 value 是不是打码占位符"——`GET /mcp/{id}` 返回的 env/headers value 本来就是打码值 `"********"`（`lib/mcpApi.ts::MASK_SENTINEL`，需要和后端 `masking.py` 的占位符保持一致），用户不碰这一行就原样提交回去，T1.4 后端的 `merge_secret_fields` 会自动识别并保留旧值；用户重新输入了内容，新值就会被当成真正的更新——前端的 `KeyValueEditor` 对打码值和真实值一视同仁，不做任何特殊渲染（不用 `type="password"`，因为脱敏值本身已经是打码占位符，没必要再遮一层）
+- **args 用"每行一个"的多行文本框而不是动态列表**：`args` 是字符串数组但一般只有几个短参数，用 `Textarea`（一行一个）比再造一个"动态增删的字符串列表"组件更省事，提交时按行 split + trim + 过滤空行
+- **列表页不展示 type**：`GET /mcp` 列表接口本身不返回 `config`（T1.4 的 `MCPServerListItem` 只有 id/name/status/updated_at，出于跟 Skill 列表一致的"列表页只要轻量元信息"考虑），所以列表表格只展示名称/状态/更新时间，type 只在点开编辑抽屉后才可见，这不是本任务的遗漏而是复用了 T1.4 已经定好的接口形状
+- 验证方式：`pnpm run build`/`pnpm run lint` 通过（唯一的 warning 是 shadcn 生成文件自带的已知 warning）；本地 `pnpm run dev` + 已在跑的 `backend-api` 容器，用临时装的 Playwright（用完删除）跑了完整闭环：创建 stdio 类型（含一个 env 变量）→ 重新打开确认 env value 显示为打码占位符 → 只改 args 保存（不碰 env）→ 重新打开改 env 为新值保存 → 创建 http 类型（含 headers）→ 不填必填的 url 验证浏览器原生 `required` 校验拦截提交 → 补填后创建成功 → 用重复名称验证 409 冲突提示正确显示 → 删除两个测试数据清理
 
 ---
 

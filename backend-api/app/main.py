@@ -8,6 +8,7 @@ from app.config import get_settings
 from app.db import dispose_engine, get_engine
 from app.logging_config import configure_logging, get_logger
 from app.modules.auth.router import router as auth_router
+from app.modules.mcp.router import router as mcp_router
 from app.modules.skills.router import router as skills_router
 from app.redis_client import close_redis_client, get_redis_client
 
@@ -41,3 +42,4 @@ app.add_middleware(
 app.include_router(health_router)
 app.include_router(auth_router)
 app.include_router(skills_router)
+app.include_router(mcp_router)

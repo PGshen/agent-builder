@@ -38,6 +38,11 @@ class Settings(BaseSettings):
     minio_bucket_skills: str = "agent-builder-skills"
     minio_bucket_workspaces: str = "agent-builder-workspaces"
 
+    # MCP Server 配置里敏感字段（env/headers 的值）的对称加密密钥，Fernet 格式（urlsafe base64，44 字符）。
+    # 开发默认值仅供本地起服务用，生产环境务必用 `python -c "from cryptography.fernet import Fernet;
+    # print(Fernet.generate_key().decode())"` 生成专属的值并通过 .env 覆盖
+    mcp_encryption_key: str = "-xwERsEgriLEQUpsEXRrYVtktCTo5AlXneJyaJxxHpE="
+
     @property
     def minio_endpoint(self) -> str:
         return f"{self.minio_host}:{self.minio_port}"

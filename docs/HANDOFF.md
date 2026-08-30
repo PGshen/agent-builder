@@ -202,3 +202,63 @@ Phase 0（T0.1~T0.5）已全部完成并归档，见上方归档索引。当前�
 - T1.4/T1.5（MCP）如果以后也要做版本历史，`versions` JSONB + `active_version` 指针这套模式可以直接照搬，不需要重新设计
 - `loadDetail` 这个"创建/保存/回滚后统一重新整体拉取详情"的模式比"各自手动拼 local state"更不容易出 bug（尤其像回滚这种内容会整体变化的操作），以后类似"操作完之后 UI 要反映服务端最新状态"的场景可以优先考虑这个模式，而不是想着"怎么从接口返回值里抠出该更新哪些 local state"
 - MinIO 里现在每个 Skill 会越攒越多历史版本对象，如果以后要做"清理旧版本"之类的运维任务，遍历 `skills.versions` JSONB 数组即可拿到所有对象 key，不需要额外索引
+
+## [T1.4] MCP Service（CRUD API） —— 2026-08-30
+
+**状态**：已完成
+
+**完成内容**：
+- `backend-api` 新增依赖 `cryptography==44.0.0`（`uv add cryptography`）
+- `app/config.py` 新增 `mcp_encryption_key`（Fernet 密钥，开发默认值已生成好，`.env.example` 同步加了 `MCP_ENCRYPTION_KEY` 及生成方式说明）
+- `app/modules/mcp/models.py`：`MCPServerConfig.config`（JSONB）改成 `config_encrypted`（Text，Fernet 密文）
+- `app/modules/mcp/` 新增四个文件：
+  - `crypto.py` —— `encrypt_config`/`decrypt_config`，Fernet 对整份 config dict 做 JSON 序列化后加解密
+  - `masking.py` —— `mask_config`（把 `env`/`headers` 两个约定字段的 value 打码成 `"********"`，key 不打码）、`merge_secret_fields`（更新时把仍是打码占位符的 value 替换回旧值，真正改过的 value 才采用新值）
+  - `schemas.py` —— `StdioMCPServerConfig`/`SSEMCPServerConfig`/`HTTPMCPServerConfig` 判别联合（`type` 字段区分）+ `MCPServerCreateRequest`/`MCPServerUpdateRequest`/`MCPServerListItem`/`MCPServerDetail`
+  - `service.py` —— `list_mcp_servers`/`create_mcp_server`/`get_mcp_server_detail`/`update_mcp_server`/`delete_mcp_server`，`MCPServerNotFoundError`/`MCPServerNameConflictError`
+  - `router.py` —— `GET/POST /mcp`、`GET/PUT/DELETE /mcp/{id}`，整体挂 `Depends(get_current_admin)`
+- `app/main.py` 挂载 `mcp_router`
+- 迁移 `alembic/versions/4a51fbaabd44_mcp_server_encrypted_config.py`（autogenerate 生成，加 `config_encrypted` 列、删 `config` 列，表里本来就没有真实数据，不需要回填分支）
+- `tests/test_mcp.py`（新增 4 个用例）+ `docker compose build/up backend-api` 重建镜像后用 `curl` 走了一遍真实容器的创建 → 列表 → 详情 → 删除全链路，确认所有返回里 `env.API_KEY` 都是 `********`
+
+**关键决策与偏差**：
+- 详见已回写到 [TASKS.md](../TASKS.md) T1.4 的"决策记录"小节，要点：config 结构用 Pydantic 判别联合对齐 SDK `mcpServers` 三种类型（stdio/sse/http）；敏感字段加密方式是"整份 config 整体用 Fernet 加密"而不是挑字段加密，存储层完全不关心 config 内部结构；脱敏展示只打码 `env`/`headers` 两个字段的 value（key 不打码，方便用户在表单里看到有哪些密钥名而不用盲改）；编辑时值仍是占位符的字段会被替换回旧值，这样"重新输入才更新"不需要前端做任何特殊处理，后端 merge 逻辑兜底
+- "测试连接"能力按 TASKS 原文允许直接跳过（stdio 起子进程/sse-http 实际网络请求的复杂度和收益不成比例），未实现
+- 没有做成"部分更新"接口（`PUT` 要求提交完整 config），跟 T1.2 Skill 保存的整体覆盖模式保持一致，避免维护两套"部分更新的 merge 逻辑"
+
+**遗留问题**：
+- MCP 敏感字段现在是"整份 config 加密"，如果以后 Agent Service（T2.1）/Agent Runner（T4.3）需要读取某个 MCP 配置去组装 SDK 参数，需要调用 `crypto.decrypt_config`（内部函数，当前只有 `service.get_mcp_server_detail` 用到），记得这是明文，只应该在服务端组装 SDK 调用参数时使用，不要透传给任何 API 响应
+- `MCP_ENCRYPTION_KEY` 是全局单一密钥，没有做密钥轮换机制；如果以后要轮换密钥，需要一次性脚本用旧密钥解密所有 `config_encrypted`、新密钥重新加密，v1 没有考虑这个运维场景
+- "测试连接"能力仍然是空白，留给以后真的需要时再评估怎么做（不同 type 的探活方式差异很大）
+
+**给下一个任务的建议**：
+- T1.5（MCP 管理前端页面）：`GET /mcp/{id}` 返回的 `config.env`/`config.headers` 里已经是打码值（`"********"`），前端表单展示这些字段时直接显示打码值即可；用户不修改就原样提交打码值回 `PUT`，后端会自动保留旧值——前端不需要自己判断"这个字段改没改过"
+- 创建/编辑表单的字段应该按 `config.type` 联动显示（stdio 显示 command/args/env，sse/http 显示 url/headers），可以参考 `app/modules/mcp/schemas.py` 里三个判别联合子类型的字段定义
+- `SkillEditorSheet.tsx` 的"抽屉 + key 强制重新挂载"模式（见 T1.3 交接记录）如果 T1.5 也想用抽屉做新建/编辑可以直接照抄
+- T2.1（Agent Service）如果要在创建/编辑 Agent 时校验绑定的 MCP server 是否存在，直接查 `mcp_servers` 表即可，不需要解密 config；只有真正要把 MCP 配置组装进 SDK 调用参数时（这是 T4.3 的事）才需要解密
+
+## [T1.5] MCP 管理前端页面 —— 2026-08-30
+
+**状态**：已完成
+
+**完成内容**：
+- `frontend/src/lib/mcpApi.ts`（新增）：`StdioMCPServerConfig`/`SSEMCPServerConfig`/`HTTPMCPServerConfig` 联合类型 + `MCPServerListItem`/`MCPServerDetail` + `listMcpServers`/`getMcpServer`/`createMcpServer`/`updateMcpServer`/`deleteMcpServer`；`MASK_SENTINEL` 常量（`"********"`，需要跟后端 `masking.py` 保持一致）
+- `frontend/src/lib/keyValuePairs.ts`（新增）：`KeyValuePair` 类型 + `pairsToRecord`/`recordToPairs` 两个纯函数，env/headers 通用
+- `frontend/src/components/mcp/KeyValueEditor.tsx`（新增）：env/headers 通用的 key-value 行编辑器（新增/删除行）
+- `frontend/src/components/mcp/McpEditorSheet.tsx`（新增）：新建/编辑复用的单表单抽屉，字段按 `type`（stdio/sse/http）联动显示；type/status 用 Button 分段控件实现，没有引入新 shadcn 组件
+- `frontend/src/pages/McpPage.tsx`（重写）：列表页（名称/状态/更新时间）+ 右上角"新建 MCP Server"，点击行内名称进编辑，模式跟 `SkillsPage.tsx` 一致（`sheetOpen`/`editingId`/`openSeq` 三个 state + `key` 强制重新挂载）
+- `pnpm run build`/`pnpm run lint` 均通过（唯一 warning 是 shadcn 生成文件自带的已知 warning，非本次引入）
+- 手工端到端验证：本地 `pnpm run dev` + 已跑起来的 `backend-api` 容器（T1.4 代码），用临时装的 Playwright（用完即删）跑了一遍"创建 stdio（含 env）→ 重新打开确认 env 显示打码值 → 只改 args 保存确认不动 env → 改 env 为新值保存 → 创建 http（含 headers）→ 不填必填 url 被浏览器原生 required 校验拦截 → 补填后创建成功 → 重名创建触发 409 提示 → 删除两条测试数据"的完整闭环，全部通过
+
+**关键决策与偏差**：
+- 详见已回写到 [TASKS.md](../TASKS.md) T1.5 的"决策记录"小节，要点：新建/编辑是同一个表单（不像 Skill 那样先建后编两阶段）；type/status 选择器用 Button 分段控件而非新增 Select/RadioGroup 组件；env/headers 的打码值前端不做特殊识别，原样回显原样提交，脱敏语义完全在后端 `merge_secret_fields` 里处理；args 用"每行一个"的多行文本框
+- 调试 Playwright 脚本时踩了两个坑，记录避免以后重复：① 用 `page.click('button:has-text("http")')` 选择"类型"分段按钮时，如果页面上已经存在名字含"http"子串的行（如已创建的 `pw-http-mcp`），`:has-text` 是子串匹配，会先匹配到表格里的行按钮而不是表单里的类型按钮，改用精确匹配 `'form button:text-is("http")'` 解决；② 测试脚本本身如果中途断言失败退出，之前几步已经创建的数据不会被清理，导致下一次重跑时"创建同名"变成真的 409 冲突（不是被测的那个 409 用例，而是意外的环境脏数据），后来在脚本开头和 catch 块里都加了一个基于真实 API 的清理步骤（按名称前缀 `pw-`/`debug-` 删除），这不是本任务代码的 bug，是测试脚本自身的幂等性问题，但值得记录避免下次调试时又被这个假象误导去怀疑应用代码有 bug
+
+**遗留问题**：
+- 编辑 MCP 配置时允许切换 `type`（比如从 stdio 切到 http），前端没有对"切换类型会丢弃另一类型已填字段"做二次确认提示，属于比较少见的操作路径，v1 没有特殊处理
+- 跟 T1.3 一样，编辑表单没有"未保存改动"离开提醒，改了内容不点保存直接关闭抽屉会静默丢弃
+
+**给下一个任务的建议**：
+- T2.1/T2.2（Agent Service/Builder）如果要在表单里"勾选已有 MCP"，直接用 `listMcpServers()` 拿列表（`id`/`name`/`status`）即可，不需要关心 `config` 内部结构
+- `components/mcp/KeyValueEditor.tsx` 是通用组件，不依赖 MCP 领域的任何东西（只认识 `KeyValuePair[]`），以后别的表单如果也需要"动态 key-value 行编辑"可以直接复用
+- 调试这类"抽屉/弹层 + 表格行文本"混合页面的 Playwright 脚本时，涉及"类型/分类"这种可能和已有数据文本重名的按钮选择器，优先用 `text-is()`（精确匹配）或把选择器限定在表单/抽屉容器内，不要用宽泛的 `:has-text()`
