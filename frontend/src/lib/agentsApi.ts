@@ -108,3 +108,7 @@ export function updateAgent(id: string, body: AgentFormInput) {
 export function deleteAgent(id: string) {
   return apiClient.delete<undefined>(`/agents/${id}`)
 }
+
+export function retryAgentInit(id: string) {
+  return apiClient.post<AgentDetail>(`/agents/${id}/retry`)
+}

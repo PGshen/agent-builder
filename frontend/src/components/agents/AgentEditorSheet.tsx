@@ -19,6 +19,7 @@ import {
   createAgent,
   deleteAgent,
   getAgent,
+  retryAgentInit,
   updateAgent,
   type AgentDetail,
   type AgentStatus,
@@ -46,6 +47,9 @@ const STATUS_VARIANT: Record<AgentStatus, 'secondary' | 'default' | 'destructive
   failed: 'destructive',
 }
 
+// 状态轮询间隔：初始化通常涉及 clone 远程仓库，几秒钟量级即可看到结果，轮询频率不用太高
+const STATUS_POLL_INTERVAL_MS = 4000
+
 // 新建/编辑复用同一个表单，跟 MCP 抽屉一样是单表单（不像 Skill 需要"先建后编"两阶段）。
 // 创建成功后抽屉原地切换成"编辑态"（不关闭），继续展示状态/绑定信息，呼应 T2.2 原本
 // "创建后能看到初始化状态"的验收要求——只是载体从独立详情页换成了同一个抽屉。
@@ -71,6 +75,7 @@ export function AgentEditorSheet({ open, onOpenChange, agentId, onSaved }: Agent
   const [saveMessage, setSaveMessage] = useState<string | null>(null)
   const [submitting, setSubmitting] = useState(false)
   const [refreshing, setRefreshing] = useState(false)
+  const [retrying, setRetrying] = useState(false)
 
   useEffect(() => {
     let cancelled = false
@@ -132,6 +137,33 @@ export function AgentEditorSheet({ open, onOpenChange, agentId, onSaved }: Agent
       applyDetail(result.data)
     }
     setRefreshing(false)
+  }
+
+  // 状态是"初始化中"（非终态）时轮询，抽屉关闭或状态变成就绪/失败（终态）后自动停止，
+  // 不做实时推送（对话场景的流式是另一回事，v1 简单轮询已满足验收标准）
+  useEffect(() => {
+    if (!open || !workingId || status !== 'initializing') return
+    const timer = window.setInterval(async () => {
+      const result = await getAgent(workingId)
+      if (result.ok && result.data) {
+        applyDetail(result.data)
+      }
+    }, STATUS_POLL_INTERVAL_MS)
+    return () => window.clearInterval(timer)
+  }, [open, workingId, status])
+
+  async function handleRetry() {
+    if (!workingId) return
+    setRetrying(true)
+    setSaveError(null)
+    const result = await retryAgentInit(workingId)
+    setRetrying(false)
+    if (!result.ok || !result.data) {
+      const detail = (result.data as unknown as { detail?: string } | undefined)?.detail
+      setSaveError(detail ?? '重试失败')
+      return
+    }
+    applyDetail(result.data)
   }
 
   async function handleSubmit(event: FormEvent) {
@@ -208,6 +240,17 @@ export function AgentEditorSheet({ open, onOpenChange, agentId, onSaved }: Agent
                 disabled={refreshing}
               >
                 {refreshing ? '刷新中…' : '刷新状态'}
+              </Button>
+            )}
+            {!isCreateMode && status === 'failed' && (
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={handleRetry}
+                disabled={retrying}
+              >
+                {retrying ? '重试中…' : '重试初始化'}
               </Button>
             )}
           </div>

@@ -154,3 +154,53 @@ Phase 0（T0.1~T0.5）、Phase 1（T1.1~T1.5）均已全部完成并归档，见
 - T3.2（仓库刷新任务）落地时，`agent-runner/app/workspace/` 下的 `db.py`/`git_ops.py`/`archive.py`/`storage.py` 都可以直接复用——刷新逻辑本质是"针对已有 Agent 的仓库重新跑一遍 clone+打包+上传"，只是不需要同时处理输出快照（仓库刷新只更新 `repo_snapshot_*`，`output_snapshot_*` 保持不变），可以考虑把 `_clone_and_pack` 里 clone+打包这部分抽出来给两边共用，但也不必现在就抽象，等 T3.2 实际写的时候看是否真的重复再决定
 - 如果后续要实现"Agent 删除时清理 MinIO 对象"，需要同时清理 `workspace_snapshots` 表里记录的当前版本对象，以及所有历史版本对象（历史版本号目前没有在任何地方被索引/列出，可能需要用 `mc`/MinIO SDK 的 `list_objects` 按 `{workspace_id}/` 前缀整体删除，而不是只删表里记的那一个 key）
 - 验证方式：`uv run pytest`（agent-runner 目录下，新增 11 个用例全部通过，加上原有 2 个共 13 个）；`docker compose build/up agent-runner` 后用 `curl` 走了创建 Agent → 观察状态自动流转到 `ready`/`failed` → 检查 MinIO 对象（用一次性 `minio/mc` 容器 `mc ls`/`mc cp` 出来再用 Python `zipfile` 校验内部目录结构）→ 检查 Postgres `workspace_snapshots`/`agent_repositories` 字段的完整链路，覆盖了 TASKS.md 三条验收标准（单仓库成功、不可达仓库失败、双仓库各自独立目录），验证完删除了这三个测试 Agent 并清理了对应的 MinIO 对象
+
+## [T2.4] Agent 状态管理与展示 —— 2026-08-30
+
+**状态**：已完成
+
+**完成内容**：
+- 后端补上 T2.1/T2.3 交接记录里提到但一直没有落地成接口的"重试"：
+  - `backend-api/app/modules/agents/service.py` 新增 `AgentNotFailedError` 异常 + `retry_workspace_init(db, agent_id)`：只允许在 `Agent.status == "failed"` 时执行，重置 `status="initializing"`/`status_message=None` 后提交，再调用已有的 `tasks.trigger_workspace_init`（不重新实现发送逻辑）
+  - `backend-api/app/modules/agents/router.py` 新增 `POST /agents/{agent_id}/retry`（404 未找到 Agent、409 当前状态非 `failed`）
+  - `backend-api/tests/test_agents.py` 新增两个用例：`test_retry_init_requires_failed_status`（覆盖"初始化中时重试返回 409"→"手动改数据库模拟失败态"→"重试成功返回 200 且状态回到 initializing、status_message 清空"）、`test_retry_init_missing_agent_returns_404`
+- 前端 `frontend/src/lib/agentsApi.ts` 新增 `retryAgentInit(id)` 请求封装
+- 前端 `frontend/src/components/agents/AgentEditorSheet.tsx`：
+  - 新增状态轮询：`useEffect` 依赖 `[open, workingId, status]`，仅当抽屉打开且 `status === 'initializing'` 时启动 4 秒间隔的 `setInterval`（`STATUS_POLL_INTERVAL_MS`），复用已有的 `applyDetail` 回填数据，状态变成终态或抽屉关闭时通过 effect cleanup 自动停止
+  - 新增"重试初始化"按钮：只在 `status === 'failed'` 时渲染（紧挨状态 Badge/"刷新状态"按钮），点击调用 `retryAgentInit` 并用 `applyDetail` 回填结果，失败时复用已有的 `saveError` 提示位
+
+**关键决策与偏差**：
+- 详见已回写到 [TASKS.md](../TASKS.md) T2.4 的"决策记录"小节，要点同上"完成内容"，无额外偏差——本任务严格按 T2.1/T2.2/T2.3 交接记录里已经约定好的方案落地（重试复用 `trigger_workspace_init`、轮询挂在 `AgentEditorSheet` 而不是详情页，因为详情页在 T2.2 交互优化时已经改回抽屉）
+
+**遗留问题**：
+- 无新增遗留问题。T2.1/T2.3 交接记录里提到的"Agent 删除不清理 MinIO 对象"仍未解决，与本任务无关，留给后续运维类任务
+- 轮询间隔固定 4 秒、无退避策略，若未来 workspace 初始化耗时明显变长（比如仓库很大），轮询请求量会随之增加，v1 未做指数退避或最大轮询次数限制
+
+**给下一个任务的建议**：
+- T3.x（仓库定时刷新）：`agent_repositories.last_synced_at`/`last_synced_commit` 目前只在"创建 Agent"或"手动重试初始化"时更新，本任务未改变这一点；重试接口 `retry_workspace_init` 本质是"Agent 级别的整体重新初始化"（会重新处理所有绑定仓库+重建输出快照占位），跟 T3.2 要做的"单个仓库的增量刷新"是两个不同粒度的操作，T3.2 不要复用这个接口
+- 验证方式：`uv run pytest tests/test_agents.py`（backend-api 目录下，7 个用例全过，含本任务新增 2 个）；`docker compose build/up backend-api` 重建镜像后用 `curl` 走了真实容器的完整链路——创建一个绑定不可达仓库的 Agent → 确认自动流转到 `failed`（真实 T2.3 worker 消费，非手动模拟）→ 调用 `POST /agents/{id}/retry` 确认返回 200 且状态回到 `initializing`、`status_message` 清空 → 再次调用 retry（此时状态是 `initializing`）确认返回 409 → 删除清理；前端用临时装的 Playwright（用完 `pnpm remove playwright` 卸载、脚本文件已删除，`git status` 确认 `package.json`/`pnpm-lock.yaml` 无残留）跑了一遍真实浏览器链路：创建同样绑定不可达仓库的 Agent → 不点手动刷新，只等轮询，3 秒内自动看到状态变成"失败"且展示 `status_message` 原因 → 点"重试初始化"确认状态变回"初始化中"、按钮消失 → 全程浏览器控制台无报错；复用的开发环境是用户本地已经在跑的 `pnpm run dev`（端口 5173 已占用，未另起新进程）
+
+## [T2.1 补丁] PUT 编辑仓库后自动重新触发 workspace 初始化 —— 2026-08-30
+
+**状态**：已完成
+
+**背景（用户报告的 bug）**：用户用真实可访问的仓库 `https://github.com/PGshen/chat-web.git` 测试，创建 Agent 并绑定该仓库后，在 MinIO 里看到的 `repo-v1.zip` 是空压缩包。排查后确认 **T2.3 的 clone/打包/上传逻辑本身没有问题**（用同一个仓库、同一套代码、真实 docker compose 环境端到端重新跑了一遍，产物是 625KB/59 个文件的正常 zip）。真正原因：该 Agent 创建时数据库里 `agent_repositories` 还没有这条记录（`created_at` 比 `workspace_snapshots` 晚 4 个多小时），也就是说仓库是**创建之后通过编辑（PUT）才加上的**——而 T2.1 当时的决策是"PUT 不会重新触发 workspace 初始化"（留给 T2.4 的失败重试兜底）。但 T2.4 的 `retry_workspace_init` 只在 `Agent.status == "failed"` 时可调用，编辑后状态还是当初那次的 `ready`，导致**没有任何入口能刷新这个过期/空的快照**，页面还一直显示"就绪"，具有误导性。
+
+**完成内容**：
+- `backend-api/app/modules/agents/service.py` 的 `update_agent`：在删除重建三类绑定前，把编辑前的仓库列表按 `position` 排序后转成 `(url, branch, auth_type, auth_credential密文)` 元组序列（`old_repo_snapshot`）；重建仓库行的循环里同步收集编辑后的同构元组序列（`new_repo_snapshot`，凭证经 `masking.resolve_credential_encrypted` 解析后的密文，占位符/未提供凭证的情况会保留原密文，因此"没真改凭证"不会被误判为变化）；两个序列不相等（增删仓库、改地址/分支/鉴权方式、真正轮换了凭证、调整了顺序）时判定 `repos_changed = True`，连同其它字段一起提交同一个事务：把 `Agent.status` 重置为 `"initializing"`、清空 `status_message`；提交成功后如果 `repos_changed` 为真，才调用已有的 `tasks.trigger_workspace_init`（不重新实现发送逻辑，跟 create/retry 保持同一套触发路径）
+- 只编辑名称/描述/权限模式/skills/MCP 绑定、仓库列表原样不变时，不会触发重新初始化（这些跟仓库快照无关，重新 clone 没有意义，也避免不必要的 Runner 负载）
+- `backend-api/tests/test_agents.py` 新增 `test_update_agent_retriggers_init_only_when_repos_changed`：创建时绑定一个仓库 → 手动把状态改成 `ready`（模拟 T2.3 已经跑完）→ PUT 提交完全相同的仓库信息，断言状态仍是 `ready`（没有被误触发）→ PUT 改动仓库的 `branch`，断言状态变回 `initializing` 且 `status_message` 为空
+- `docs/TASKS.md` T2.1 决策记录里原来的"PUT 不会重新触发 workspace 初始化"条目已更新为新决策，保留了旧决策的说明作为背景
+
+**关键决策与偏差**：
+- 判定"仓库是否变化"用的是编辑前后两份仓库列表的结构化比较，不是简单看请求体里有没有 `repositories` 字段——这样"仓库数量、顺序不变但改了某一个的 branch/鉴权方式"也能正确识别
+- 只有仓库这一类绑定的变化会触发重新初始化；skills/MCP 绑定变化不会，因为 workspace 快照只跟仓库内容有关（这两类绑定是运行时对话链路要用的，跟 T2.3 打包的仓库快照/输出快照无关）
+- 前端 `AgentEditorSheet.tsx` 不需要改动：保存后本来就会用响应体 `applyDetail(result.data)` 回填最新 `status`，T2.4 已经实现的轮询 `useEffect` 是按 `status === 'initializing'` 触发的，状态一变自动就开始轮询，不需要额外接线
+
+**遗留问题**：
+- 用户最初报告问题的那个 Agent（"问题排查"，`76bcc309-9334-4c91-a69f-bd46cb14b267`）保留在数据库里未删除，仓库绑定跟当前状态实际上一致，本补丁的"内容比较"判定不出差异、不会自动帮它补一次初始化；用户需要自己对它做一次真正的变更（比如改一下 branch 再改回来，或者删掉仓库重新加）来触发一次真实的重新初始化，才能让它的快照变成非空
+- 与 T2.1/T2.3 一致的已知遗留仍未解决：Agent 删除、以及快照版本号递增后旧版本对象都不清理 MinIO 里的历史对象；这次触发逻辑改动后版本号会因为一次编辑多产生一个新版本对象，进一步放大了这个遗留问题的影响，值得在处理"MinIO 对象生命周期管理"时一并考虑"编辑触发的重新初始化算不算需要清理旧版本"
+
+**给下一个任务的建议**：
+- T3.2（仓库刷新任务）如果要做"定时自动刷新"，可以参考这里"结构化比较仓库列表"的思路判断是否真的需要重新 clone，但 T3.2 是单仓库增量刷新、不牵扯 Agent 整体状态流转，不要直接复用 `update_agent` 里这段逻辑
+- 验证方式：`uv run pytest tests/test_agents.py`（8 个用例全过，含本次新增 1 个）；`docker compose build/up backend-api` 重建镜像后用 `curl` 复现了完整 bug 场景并验证修复——创建一个不绑仓库的 Agent（产生空 `repo-v1.zip`，对应用户最初遇到的问题）→ PUT 加上 `https://github.com/PGshen/chat-web.git` → 确认响应里状态立即变回 `initializing` → 等真实 T2.3 worker 跑完 → 确认状态回到 `ready`、`agent_repositories.last_synced_commit` 写入了真实 commit hash、MinIO 里新增的 `repo-v2.zip`（625KB/59 个文件）内容正确；同一份 PUT 仓库信息原样再提交一次，确认状态没有被重置（没有误触发）；验证完删除了测试 Agent 并清理了对应的 MinIO 对象（`repo-v1.zip`/`repo-v2.zip`/`output-v1.zip`）

@@ -288,7 +288,7 @@
 - **仓库凭证脱敏方式**：与 T1.4 的 `env`/`headers` 脱敏思路一致但简化——`auth_credential` 是单个字符串字段（不是 key-value dict），所以 `app/modules/agents/masking.py` 只有 `mask_credential`（有值就打码成 `"********"`，`auth_type="none"` 或未设置时返回 `None`）和 `resolve_credential_encrypted`（提交值是占位符时沿用旧密文，否则重新加密）两个函数，没有 T1.4 `merge_secret_fields` 那种按 key 遍历的逻辑
 - **编辑仓库列表如何保留凭证**：`AgentRepositoryInput` 增加可选 `id` 字段——编辑时前端把已有仓库原样带上 `id`（凭证字段仍是打码占位符），后端按 `id` 匹配到编辑前的那一行仓库来源密文；不带 `id`（或 `id` 对不上任何现有行）视为新增仓库，此时如果凭证仍是占位符会被当成"未提供凭证"（`auth_credential` 落 `NULL`），这是新增仓库场景下的既有限制，不是遗漏（占位符本来就只有 GET 响应才会产生，新增仓库不可能合法地提交占位符）
 - **绑定关系更新策略**：`PUT /agents/{id}` 的 skills/MCP/仓库三类绑定都是"先整体删再整体插入"（不做差量 diff），跟 T1.2/T1.4 的"整体覆盖"风格一致；仓库这一类因为要保留凭证，在删除前先把编辑前的行按 `id` 建好索引供匹配使用（见上一条）
-- **PUT 不会重新触发 workspace 初始化**：TASKS 原文只要求"编辑保存后再次查询，绑定关系与最新提交一致"，没有要求编辑后自动重跑 T2.3；是否应该在编辑仓库列表后自动重新初始化 workspace，留给 T2.4（明确写了"失败状态下提供重试操作重新触发 T2.3"）或更后面的任务决定，本任务不擅自加这个行为
+- **PUT 会在仓库绑定实际发生变化时自动重新触发 workspace 初始化**（2026-08-30 修正，原决策见下）：`update_agent` 在删除重建三类绑定前后，分别按 `position` 顺序把仓库列表转成 `(url, branch, auth_type, auth_credential密文)` 元组序列做比较，序列不相等（新增/删除/改地址/改分支/改鉴权方式/真正轮换了凭证/调整了顺序）才判定为"仓库变了"；只有这种情况才把 `Agent.status` 重置为 `initializing`（清空 `status_message`）并调用 `tasks.trigger_workspace_init`，仅编辑名称/描述/权限模式/skills/MCP 绑定不会触发重新初始化（这些跟仓库快照无关，重新 clone 是浪费）。~~原决策~~：最初认为"编辑后是否自动重新初始化"留给 T2.4 或更后面的任务决定，T2.4 也确实只做了"失败状态下手动重试"；但实际使用中发现一个真实 bug 场景——创建 Agent 时不绑仓库（或绑的仓库集合还没确定）触发一次初始化产生空快照，随后编辑加上仓库，Agent 状态还是当初那次的 `ready`，导致 MinIO 里的仓库快照永久停留在编辑前的状态且没有任何入口能刷新（`retry_workspace_init` 只在 `status == "failed"` 时可调用，编辑后状态是 `ready` 不满足），必须补上这个自动触发逻辑
 - **补充了 TASKS 原文没写的 `DELETE /agents/{id}`**：为了和已有的 Skill/MCP 管理页保持同样的完整 CRUD 形状（T2.2 大概率需要"删除 Agent"这个操作），补了一个直接删 `agents` 行的接口；子表（`agent_skills`/`agent_mcp_servers`/`agent_repositories`/`workspace_snapshots`）都在 T1.1 建表时定义了 `ondelete="CASCADE"`，数据库层面自动级联删除，不需要应用层手动清理。**已知遗留**：T2.3 落地后 Agent 会在 MinIO 里产生仓库快照/输出快照对象，那时候的 Agent 删除需要同步清理这些 MinIO 对象（参考 Skill 删除的做法），本任务时 MinIO 里还没有东西，暂不需要处理
 - **列表接口返回绑定数量而非明细**：`GET /agents` 的 `AgentListItem` 只带 `skill_count`/`mcp_server_count`/`repository_count`（用 `GROUP BY` 聚合查询算，不是 N+1 逐个查），完整的绑定明细（skill/MCP 名称、仓库详情）只有 `GET /agents/{id}` 详情接口才返回，跟 Skill/MCP 列表页"只要轻量元信息"的一贯风格一致
 - **仓库鉴权方式的取值**：按 TASKS 原文"具体取值在 T2.1 落地时约束"，定为 `Literal["none", "token", "ssh_key"]`（`AgentRepositoryInput.auth_type`）
@@ -361,6 +361,11 @@
 **验收标准**：
 - Agent 详情页能看到当前状态，状态变化后刷新/轮询能看到最新结果
 - "失败"状态下点击重试，能重新触发初始化并观察到状态回到"初始化中"直至最终结果
+
+**决策记录**（实现时落地）：
+- **后端新增 `POST /agents/{agent_id}/retry` 接口**：TASKS 原文和 T2.1/T2.3 交接记录都只约定了"重试直接复用 `trigger_workspace_init(agent_id)`"，但没有落地成 HTTP 接口——本任务补上。`service.retry_workspace_init` 只允许在 `status == "failed"` 时执行（否则抛 `AgentNotFailedError` → HTTP 409，防止初始化中/已就绪时被误触发打断），执行时把 `status` 重置为 `"initializing"`、清空 `status_message`，再调用已有的 `tasks.trigger_workspace_init`，不重新实现发送逻辑
+- **前端轮询挂在 `AgentEditorSheet` 组件而非详情页**（详情页在 T2.2 交互优化时已经改成抽屉，不存在独立详情页组件）：`useEffect` 依赖 `[open, workingId, status]`，只在抽屉打开、`status === 'initializing'` 时启动 `setInterval`（4 秒一次，`STATUS_POLL_INTERVAL_MS`），状态变成终态（`ready`/`failed`）或抽屉关闭时通过 effect cleanup 自动停止，不会产生无意义的持续请求
+- **重试按钮只在 `status === 'failed'` 时渲染**，位置紧挨着已有的状态 Badge 和"刷新状态"按钮；点击后复用 `applyDetail` 回填最新状态（同创建/保存/手动刷新三处的模式），不单独维护一份状态更新逻辑
 
 ---
 

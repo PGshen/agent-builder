@@ -22,6 +22,14 @@ class AgentNameConflictError(Exception):
         super().__init__(f"Agent 名称已存在：{name}")
 
 
+class AgentNotFailedError(Exception):
+    """重试初始化只允许在"失败"状态下发起，避免打断正在进行中/已就绪的 workspace。"""
+
+    def __init__(self, status: str) -> None:
+        self.status = status
+        super().__init__(f"当前状态为 {status}，只有失败状态才能重试初始化")
+
+
 class InvalidBindingError(Exception):
     """创建/编辑时绑定了不存在的 skill 或 MCP server。"""
 
@@ -227,6 +235,11 @@ async def update_agent(
         ).scalars()
     }
 
+    old_repo_snapshot = [
+        (repo.url, repo.branch, repo.auth_type, repo.auth_credential)
+        for repo in sorted(existing_repos.values(), key=lambda r: r.position)
+    ]
+
     agent.name = name
     agent.description = description
     agent.permission_mode = permission_mode
@@ -240,6 +253,8 @@ async def update_agent(
         db.add(AgentSkill(agent_id=agent_id, skill_id=skill_id))
     for mcp_server_id in mcp_server_ids:
         db.add(AgentMCPServer(agent_id=agent_id, mcp_server_id=mcp_server_id))
+
+    new_repo_snapshot = []
     for position, repo in enumerate(repositories):
         existing = existing_repos.get(repo.id) if repo.id is not None else None
         credential_encrypted = masking.resolve_credential_encrypted(
@@ -255,6 +270,12 @@ async def update_agent(
                 position=position,
             )
         )
+        new_repo_snapshot.append((repo.url, repo.branch, repo.auth_type, credential_encrypted))
+
+    repos_changed = old_repo_snapshot != new_repo_snapshot
+    if repos_changed:
+        agent.status = "initializing"
+        agent.status_message = None
 
     try:
         await db.commit()
@@ -262,6 +283,23 @@ async def update_agent(
         await db.rollback()
         raise AgentNameConflictError(name) from exc
     await db.refresh(agent)
+
+    if repos_changed:
+        tasks.trigger_workspace_init(str(agent.id))
+    return agent
+
+
+async def retry_workspace_init(db: AsyncSession, agent_id: uuid.UUID) -> Agent:
+    agent = await _get_agent_or_raise(db, agent_id)
+    if agent.status != "failed":
+        raise AgentNotFailedError(agent.status)
+
+    agent.status = "initializing"
+    agent.status_message = None
+    await db.commit()
+    await db.refresh(agent)
+
+    tasks.trigger_workspace_init(str(agent.id))
     return agent
 
 

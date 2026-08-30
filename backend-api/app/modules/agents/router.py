@@ -132,6 +132,19 @@ async def update_agent(
     return _to_detail(agent, skills, mcp_servers, repositories)
 
 
+@router.post("/{agent_id}/retry", response_model=AgentDetail)
+async def retry_agent_init(agent_id: UUID, db: AsyncSession = Depends(get_db_session)) -> AgentDetail:
+    try:
+        agent = await service.retry_workspace_init(db, agent_id)
+    except service.AgentNotFoundError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Agent 不存在") from exc
+    except service.AgentNotFailedError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+
+    _, skills, mcp_servers, repositories = await service.get_agent_detail(db, agent.id)
+    return _to_detail(agent, skills, mcp_servers, repositories)
+
+
 @router.delete("/{agent_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_agent(agent_id: UUID, db: AsyncSession = Depends(get_db_session)) -> None:
     try:

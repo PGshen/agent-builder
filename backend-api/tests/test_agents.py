@@ -7,7 +7,7 @@ from app.config import get_settings
 from app.db import get_session_factory
 from app.main import app
 from app.modules.agents.masking import MASK_SENTINEL
-from app.modules.agents.models import AgentRepository
+from app.modules.agents.models import Agent, AgentRepository
 from app.modules.agents import crypto as agent_crypto
 from app.modules.mcp import crypto as mcp_crypto
 from app.modules.mcp.models import MCPServerConfig
@@ -195,6 +195,113 @@ async def test_agent_lifecycle_with_bindings_and_repo_credential_masking():
 
         get_after_delete = await client.get(f"/agents/{agent_id}", headers=headers)
         assert get_after_delete.status_code == 404
+
+
+async def test_update_agent_retriggers_init_only_when_repos_changed():
+    name = f"agent-put-retrigger-{uuid.uuid4().hex[:8]}"
+    async with await _client() as client:
+        headers = await _auth_headers(client)
+
+        created = await client.post(
+            "/agents",
+            json={
+                "name": name,
+                "repositories": [
+                    {"url": "https://example.com/repo.git", "branch": "main", "auth_type": "none"}
+                ],
+            },
+            headers=headers,
+        )
+        assert created.status_code == 201
+        payload = created.json()
+        agent_id = payload["id"]
+        repo_id = payload["repositories"][0]["id"]
+
+        # 模拟 T2.3 worker 已经跑完初始化（真实场景由 Runner 写入 ready）
+        session_factory = get_session_factory()
+        async with session_factory() as db:
+            agent = await db.get(Agent, uuid.UUID(agent_id))
+            agent.status = "ready"
+            await db.commit()
+
+        # 仓库列表原样不变（url/branch/auth_type 都一样）：不应该把 ready 重置为 initializing
+        put_unchanged = await client.put(
+            f"/agents/{agent_id}",
+            json={
+                "name": name,
+                "repositories": [
+                    {
+                        "id": repo_id,
+                        "url": "https://example.com/repo.git",
+                        "branch": "main",
+                        "auth_type": "none",
+                    }
+                ],
+            },
+            headers=headers,
+        )
+        assert put_unchanged.status_code == 200
+        assert put_unchanged.json()["status"] == "ready"
+
+        # 改了仓库 branch：视为仓库绑定发生变化，应该自动重新触发初始化（状态回到 initializing）
+        put_changed = await client.put(
+            f"/agents/{agent_id}",
+            json={
+                "name": name,
+                "repositories": [
+                    {
+                        "id": repo_id,
+                        "url": "https://example.com/repo.git",
+                        "branch": "develop",
+                        "auth_type": "none",
+                    }
+                ],
+            },
+            headers=headers,
+        )
+        assert put_changed.status_code == 200
+        assert put_changed.json()["status"] == "initializing"
+        assert put_changed.json()["status_message"] is None
+
+        await client.delete(f"/agents/{agent_id}", headers=headers)
+
+
+async def test_retry_init_requires_failed_status():
+    name = f"agent-retry-{uuid.uuid4().hex[:8]}"
+    async with await _client() as client:
+        headers = await _auth_headers(client)
+
+        created = await client.post("/agents", json={"name": name}, headers=headers)
+        assert created.status_code == 201
+        agent_id = created.json()["id"]
+        assert created.json()["status"] == "initializing"
+
+        # 当前是 initializing，不允许重试
+        retry_while_initializing = await client.post(f"/agents/{agent_id}/retry", headers=headers)
+        assert retry_while_initializing.status_code == 409
+
+        # 直接改数据库模拟"已失败"状态（真实场景由 T2.3 Runner 任务写入）
+        session_factory = get_session_factory()
+        async with session_factory() as db:
+            agent = await db.get(Agent, uuid.UUID(agent_id))
+            agent.status = "failed"
+            agent.status_message = "clone 失败：仓库地址不可达"
+            await db.commit()
+
+        retry_response = await client.post(f"/agents/{agent_id}/retry", headers=headers)
+        assert retry_response.status_code == 200
+        retried = retry_response.json()
+        assert retried["status"] == "initializing"
+        assert retried["status_message"] is None
+
+        await client.delete(f"/agents/{agent_id}", headers=headers)
+
+
+async def test_retry_init_missing_agent_returns_404():
+    async with await _client() as client:
+        headers = await _auth_headers(client)
+        response = await client.post(f"/agents/{uuid.uuid4()}/retry", headers=headers)
+    assert response.status_code == 404
 
 
 async def test_duplicate_agent_name_rejected():

@@ -77,10 +77,13 @@ local-backend: ## 本地前台启动 backend-api（单独占用一个终端，Ct
 	@cd backend-api && set -a && . ./.env && set +a && \
 	uv run uvicorn app.main:app --reload --host 0.0.0.0 --port "$${BACKEND_API_PORT:-8080}"
 
+# local-runner: Windows 下 celery 默认 prefork pool 依赖 billiard 的 spawn 子进程句柄复制，从 Git
+# Bash/Cygwin 里启动时会报 WinError 5/87；--pool=solo 单进程运行任务规避这个问题。生产环境（Linux
+# 容器，见 agent-runner/entrypoint.sh）不受影响，不需要同样处理
 local-runner: ## 本地前台启动 agent-runner（celery worker + http server，Ctrl+C 停止）
 	@cd agent-runner && set -a && . ./.env && set +a && \
 	trap 'kill 0' EXIT INT TERM; \
-	uv run celery -A app.worker.celery_app worker --loglevel=info & \
+	uv run celery -A app.worker.celery_app worker --loglevel=info --pool=solo & \
 	uv run uvicorn app.server.main:app --reload --host 0.0.0.0 --port "$${AGENT_RUNNER_HTTP_PORT:-8100}" & \
 	wait
 
