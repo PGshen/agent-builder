@@ -1,12 +1,12 @@
 SHELL := bash
 .DEFAULT_GOAL := help
 .PHONY: help up down down-v infra-up infra-down services-up services-down restart ps logs \
-        install local-up local-down local-logs local-backend local-runner local-frontend
+        install local-up local-down local-logs local-backend local-runner local-scheduler local-frontend
 
 COMPOSE := docker compose
 
 INFRA_SERVICES := postgres redis minio minio-init
-APP_SERVICES   := backend-api agent-runner frontend
+APP_SERVICES   := backend-api agent-runner scheduler frontend
 
 PID_DIR := .make-pids
 LOG_DIR := .make-logs
@@ -68,9 +68,10 @@ services-down: ## 停止容器中的业务服务（基础设施容器保留运�
 # 这里在子 shell 里 source 对应目录的 .env 后再启动，保证端口/连接信息一致
 # ------------------------------------------------------------------
 
-install: ## 安装本地开发依赖（backend-api/agent-runner 用 uv，frontend 用 pnpm）
+install: ## 安装本地开发依赖（backend-api/agent-runner/scheduler 用 uv，frontend 用 pnpm）
 	cd backend-api && uv sync
 	cd agent-runner && uv sync
+	cd scheduler && uv sync
 	cd frontend && pnpm install
 
 local-backend: ## 本地前台启动 backend-api（单独占用一个终端，Ctrl+C 停止）
@@ -83,9 +84,14 @@ local-backend: ## 本地前台启动 backend-api（单独占用一个终端，Ct
 local-runner: ## 本地前台启动 agent-runner（celery worker + http server，Ctrl+C 停止）
 	@cd agent-runner && set -a && . ./.env && set +a && \
 	trap 'kill 0' EXIT INT TERM; \
-	uv run celery -A app.worker.celery_app worker --loglevel=info --pool=solo & \
+	uv run celery -A app.worker.celery_app worker --loglevel=info --pool=solo -Q agent-runner & \
 	uv run uvicorn app.server.main:app --reload --host 0.0.0.0 --port "$${AGENT_RUNNER_HTTP_PORT:-8100}" & \
 	wait
+
+# local-scheduler: 同 local-runner，Windows 下用 --pool=solo 规避 prefork/billiard 的 WinError 5/87
+local-scheduler: ## 本地前台启动 scheduler（celery worker+beat，Ctrl+C 停止）
+	@cd scheduler && set -a && . ./.env && set +a && \
+	uv run celery -A app.celery_app worker --beat --loglevel=info --pool=solo -Q scheduler
 
 local-frontend: ## 本地前台启动 frontend（vite dev server，Ctrl+C 停止）
 	cd frontend && pnpm dev
@@ -98,15 +104,19 @@ local-up: infra-up ## 一键本地启动全部业务服务（后台进程，基�
 		> ../$(LOG_DIR)/backend-api.log 2>&1 & echo $$! > ../$(PID_DIR)/backend-api.pid'
 	@echo "启动 agent-runner worker（后台）..."
 	@bash -c 'cd agent-runner && set -a && . ./.env && set +a && \
-		nohup uv run celery -A app.worker.celery_app worker --loglevel=info \
+		nohup uv run celery -A app.worker.celery_app worker --loglevel=info -Q agent-runner \
 		> ../$(LOG_DIR)/agent-runner-worker.log 2>&1 & echo $$! > ../$(PID_DIR)/agent-runner-worker.pid'
 	@echo "启动 agent-runner http server（后台）..."
 	@bash -c 'cd agent-runner && set -a && . ./.env && set +a && \
 		nohup uv run uvicorn app.server.main:app --host 0.0.0.0 --port "$${AGENT_RUNNER_HTTP_PORT:-8100}" \
 		> ../$(LOG_DIR)/agent-runner-server.log 2>&1 & echo $$! > ../$(PID_DIR)/agent-runner-server.pid'
+	@echo "启动 scheduler（后台）..."
+	@bash -c 'cd scheduler && set -a && . ./.env && set +a && \
+		nohup uv run celery -A app.celery_app worker --beat --loglevel=info -Q scheduler \
+		> ../$(LOG_DIR)/scheduler.log 2>&1 & echo $$! > ../$(PID_DIR)/scheduler.pid'
 	@echo "启动 frontend（后台）..."
 	@bash -c 'cd frontend && nohup pnpm dev > ../$(LOG_DIR)/frontend.log 2>&1 & echo $$! > ../$(PID_DIR)/frontend.pid'
-	@echo "本地业务服务已在后台启动：backend-api / agent-runner(worker+server) / frontend"
+	@echo "本地业务服务已在后台启动：backend-api / agent-runner(worker+server) / scheduler / frontend"
 	@echo "日志：$(LOG_DIR)/*.log（'make local-logs' 跟随查看），停止：'make local-down'"
 
 local-down: ## 停止 local-up 启动的所有本地后台进程

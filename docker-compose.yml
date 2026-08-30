@@ -152,6 +152,30 @@ services:
       timeout: 5s
       retries: 10
 
+  scheduler:
+    build: ./scheduler
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # 同 backend-api/agent-runner：compose 网络内部用服务名 + 组件标准端口覆盖 .env 里给宿主机本地开发用的值
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+    networks:
+      - agent-builder-net
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    # 只是常驻的 Celery worker+beat 进程，不对外提供 HTTP 接口，健康检查改用 Celery 自带的存活探测
+    healthcheck:
+      test: ["CMD", "celery", "-A", "app.celery_app", "inspect", "ping"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+
   frontend:
     build: ./frontend
     restart: unless-stopped

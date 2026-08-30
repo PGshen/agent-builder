@@ -5,7 +5,10 @@ set -e
 
 PORT="${AGENT_RUNNER_HTTP_PORT:-8100}"
 
-celery -A app.worker.celery_app worker --loglevel=info &
+# -Q agent-runner：scheduler（T3.1）也是一个 Celery worker，共用同一个 Redis broker；不显式限定
+# 队列的话，两边 worker 会争抢同一个默认队列 "celery" 里彼此的任务，导致消息被不认识的一方悄悄丢弃
+# （Runner 消息路由约定见 docs/TASKS.md T3.1 决策记录）
+celery -A app.worker.celery_app worker --loglevel=info -Q agent-runner &
 CELERY_PID=$!
 
 uvicorn app.server.main:app --host 0.0.0.0 --port "$PORT" &

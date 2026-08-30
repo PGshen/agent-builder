@@ -1,0 +1,28 @@
+[project]
+name = "agent-builder-scheduler"
+version = "0.1.0"
+description = "AgentBuilder Scheduler"
+requires-python = ">=3.12"
+dependencies = [
+    "celery[redis]==5.4.0",
+    "redis==5.2.1",
+    "pydantic-settings==2.7.1",
+    "asyncpg==0.30.0",
+    "structlog==24.4.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest==8.3.4",
+    "pytest-asyncio==0.25.1",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]

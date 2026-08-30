@@ -29,6 +29,8 @@ def trigger_workspace_init(agent_id: str) -> None:
     不抛出——Agent 的创建/编辑接口不应该因为触发后台任务失败而失败，T2.4 会提供状态展示与手动重试入口。
     """
     try:
-        _celery_producer().send_task(WORKSPACE_INIT_TASK_NAME, args=[agent_id])
+        # queue="agent-runner"：显式路由到 Runner 专属队列，与 scheduler（T3.1）共用同一个 broker 时
+        # 避免两边 worker 争抢彼此的任务（docs/TASKS.md T3.1 决策记录）
+        _celery_producer().send_task(WORKSPACE_INIT_TASK_NAME, args=[agent_id], queue="agent-runner")
     except Exception:
         logger.warning("trigger_workspace_init_failed", agent_id=agent_id, exc_info=True)
