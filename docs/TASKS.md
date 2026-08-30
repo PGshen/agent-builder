@@ -282,6 +282,18 @@
 - 创建请求缺必填字段或绑定了不存在的 skill/MCP 时能明确拒绝
 - 编辑保存后再次查询，绑定关系与最新提交一致
 
+**决策记录**（实现时落地）：
+- **触发 Workspace 初始化的方式（T2.3 尚未实现，先约定契约）**：backend-api 新增 `celery[redis]==5.4.0` 依赖，只当 Celery **生产者**用（`app/modules/agents/tasks.py::trigger_workspace_init`，`Celery(...).send_task(...)`，不 `include` 任何任务模块、不配置 result backend），创建 Agent 成功后向名为 **`"workspace.init"`**、参数 `args=[agent_id]`（str）的任务发一条消息到 broker（与 agent-runner 共用同一个 Redis、同一个 `CELERY_BROKER_DB`）。T2.3 落地时，Runner 侧必须注册一个同名（`"workspace.init"`）、接受这个参数签名的任务去消费。发送失败（如 broker 不可达）只记警告日志、不抛异常，不阻塞 Agent 元数据创建——对应 TECH_DESIGN 4.1"Agent Service 只负责触发"的解耦设计。T2.3 上线前，这些消息会在 broker 队列里排队等待，没有副作用
+- **仓库凭证加密**：与 T1.4 保持相同方式（Fernet 对称加密），但**没有复用** `MCP_ENCRYPTION_KEY`——新增独立配置项 `AGENT_REPO_ENCRYPTION_KEY`（`app/modules/agents/crypto.py`），原因是这是两个不同模块各自拥有的加密字段，各自独立密钥更符合最小权限原则（轮换一个不影响另一个），产品语义上也没有"必须共用一把钥匙"的要求
+- **仓库凭证脱敏方式**：与 T1.4 的 `env`/`headers` 脱敏思路一致但简化——`auth_credential` 是单个字符串字段（不是 key-value dict），所以 `app/modules/agents/masking.py` 只有 `mask_credential`（有值就打码成 `"********"`，`auth_type="none"` 或未设置时返回 `None`）和 `resolve_credential_encrypted`（提交值是占位符时沿用旧密文，否则重新加密）两个函数，没有 T1.4 `merge_secret_fields` 那种按 key 遍历的逻辑
+- **编辑仓库列表如何保留凭证**：`AgentRepositoryInput` 增加可选 `id` 字段——编辑时前端把已有仓库原样带上 `id`（凭证字段仍是打码占位符），后端按 `id` 匹配到编辑前的那一行仓库来源密文；不带 `id`（或 `id` 对不上任何现有行）视为新增仓库，此时如果凭证仍是占位符会被当成"未提供凭证"（`auth_credential` 落 `NULL`），这是新增仓库场景下的既有限制，不是遗漏（占位符本来就只有 GET 响应才会产生，新增仓库不可能合法地提交占位符）
+- **绑定关系更新策略**：`PUT /agents/{id}` 的 skills/MCP/仓库三类绑定都是"先整体删再整体插入"（不做差量 diff），跟 T1.2/T1.4 的"整体覆盖"风格一致；仓库这一类因为要保留凭证，在删除前先把编辑前的行按 `id` 建好索引供匹配使用（见上一条）
+- **PUT 不会重新触发 workspace 初始化**：TASKS 原文只要求"编辑保存后再次查询，绑定关系与最新提交一致"，没有要求编辑后自动重跑 T2.3；是否应该在编辑仓库列表后自动重新初始化 workspace，留给 T2.4（明确写了"失败状态下提供重试操作重新触发 T2.3"）或更后面的任务决定，本任务不擅自加这个行为
+- **补充了 TASKS 原文没写的 `DELETE /agents/{id}`**：为了和已有的 Skill/MCP 管理页保持同样的完整 CRUD 形状（T2.2 大概率需要"删除 Agent"这个操作），补了一个直接删 `agents` 行的接口；子表（`agent_skills`/`agent_mcp_servers`/`agent_repositories`/`workspace_snapshots`）都在 T1.1 建表时定义了 `ondelete="CASCADE"`，数据库层面自动级联删除，不需要应用层手动清理。**已知遗留**：T2.3 落地后 Agent 会在 MinIO 里产生仓库快照/输出快照对象，那时候的 Agent 删除需要同步清理这些 MinIO 对象（参考 Skill 删除的做法），本任务时 MinIO 里还没有东西，暂不需要处理
+- **列表接口返回绑定数量而非明细**：`GET /agents` 的 `AgentListItem` 只带 `skill_count`/`mcp_server_count`/`repository_count`（用 `GROUP BY` 聚合查询算，不是 N+1 逐个查），完整的绑定明细（skill/MCP 名称、仓库详情）只有 `GET /agents/{id}` 详情接口才返回，跟 Skill/MCP 列表页"只要轻量元信息"的一贯风格一致
+- **仓库鉴权方式的取值**：按 TASKS 原文"具体取值在 T2.1 落地时约束"，定为 `Literal["none", "token", "ssh_key"]`（`AgentRepositoryInput.auth_type`）
+- 验证方式：`uv run pytest`（新增 `tests/test_agents.py` 5 个用例，覆盖鉴权拦截、缺字段 422、绑定不存在的 skill/MCP 400、完整生命周期含仓库凭证打码/占位符回填/真正轮换 + 用后门方式解密验证密文、重名 409）；`docker compose build/up backend-api` 重建镜像后用 `curl` 走了一遍真实容器的登录 → 创建 → 列表 → 删除；用 `redis-cli` 确认真实 Celery 消息确实进了 broker 队列（`LLEN celery`），验证 `trigger_workspace_init` 端到端可用，随后清空了这些仅供验证用的队列消息，避免将来 T2.3 worker 上线后消费到测试脏数据
+
 ---
 
 ### T2.2 Agent Builder 前端页面

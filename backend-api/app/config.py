@@ -24,6 +24,9 @@ class Settings(BaseSettings):
     # db 0/1 是 agent-runner 的 Celery broker/result backend，db 2 预留给 T4.2 Agent 互斥锁，
     # 这里单独用 db 3 存登录 token，避免几个用途的 key 空间混在一起
     auth_redis_db: int = 3
+    # backend-api 只作为 Celery 任务的生产者（不消费、不需要 result backend），broker db 与
+    # agent-runner 保持一致（同一个 CELERY_BROKER_DB 环境变量），发的任务由 T2.3 的 Runner worker 消费
+    celery_broker_db: int = 0
 
     # 极简单账号体系（非多租户）：管理员账号密码直接来自环境变量，与 Postgres/MinIO 密码同样明文存在 .env 里
     admin_username: str = "admin"
@@ -43,6 +46,10 @@ class Settings(BaseSettings):
     # print(Fernet.generate_key().decode())"` 生成专属的值并通过 .env 覆盖
     mcp_encryption_key: str = "-xwERsEgriLEQUpsEXRrYVtktCTo5AlXneJyaJxxHpE="
 
+    # Agent 绑定仓库的鉴权凭证（auth_credential）的对称加密密钥，与 mcp_encryption_key 同样是 Fernet
+    # 格式但用途独立（各模块各自的加密字段用各自的密钥，互不影响；见 T2.1 决策记录，方式与 T1.4 保持一致）
+    agent_repo_encryption_key: str = "uxYa2PhAS4d5Q48cAgVZkbF_m-hRSlozCfTiuNdsxW4="
+
     @property
     def minio_endpoint(self) -> str:
         return f"{self.minio_host}:{self.minio_port}"
@@ -61,10 +68,17 @@ class Settings(BaseSettings):
             f"@{self.postgres_host}:{self.postgres_port}/{self.postgres_db}"
         )
 
+    def _redis_url(self, db: int) -> str:
+        auth = f":{self.redis_password}@" if self.redis_password else ""
+        return f"redis://{auth}{self.redis_host}:{self.redis_port}/{db}"
+
     @property
     def auth_redis_url(self) -> str:
-        auth = f":{self.redis_password}@" if self.redis_password else ""
-        return f"redis://{auth}{self.redis_host}:{self.redis_port}/{self.auth_redis_db}"
+        return self._redis_url(db=self.auth_redis_db)
+
+    @property
+    def celery_broker_url(self) -> str:
+        return self._redis_url(db=self.celery_broker_db)
 
 
 @lru_cache
