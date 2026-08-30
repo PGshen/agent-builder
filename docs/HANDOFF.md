@@ -120,3 +120,37 @@ Phase 0（T0.1~T0.5）、Phase 1（T1.1~T1.5）均已全部完成并归档，见
 **给下一个任务的建议**：
 - T2.4 实现状态轮询时，改动位置在 `components/agents/AgentEditorSheet.tsx` 而不是某个独立的详情页组件了——`handleRefreshStatus`（已经是可复用的独立函数）可以直接被一个 `setInterval` 循环调用，抽屉打开且 `workingId` 非空、状态是 `initializing` 时启动轮询，变成终态（`ready`/`failed`）或抽屉关闭时停止
 - 如果后续还有其它地方需要"从一批选项里多选几个，带搜索"的交互（比如 T5.x 对外 API 权限范围选择之类），优先复用 `components/agents/TransferList.tsx`，必要时把它挪到更通用的位置（比如 `components/common/`），而不是重新写一个
+
+## [T2.3] Workspace 初始化任务 —— 2026-08-30
+
+**状态**：已完成
+
+**完成内容**：
+- `agent-runner` 新增 `app/workspace/` 模块（五个文件）：
+  - `db.py` —— `asyncpg` 原生 SQL 读写（不引入 SQLAlchemy ORM），`load_agent_context`/`mark_agent_status`/`save_workspace_snapshot`/`update_repository_sync_info`
+  - `crypto.py` —— `decrypt_credential`，与 backend-api 共用同一个 `AGENT_REPO_ENCRYPTION_KEY`
+  - `git_ops.py` —— `clone_repository`（三种 auth_type 的 clone 方式）、`repo_dir_name`（快照内目录命名与去重）、`WorkspaceInitError`
+  - `archive.py` —— `zip_directory`/`empty_zip`
+  - `storage.py` —— MinIO 存取，`repo_snapshot_key`/`output_snapshot_key` 两个 object key 生成函数
+- `app/worker/tasks/workspace.py` —— Celery 任务 `workspace.init`（对应 backend-api T2.1 已经在发的任务名/参数签名），`init_workspace(agent_id)` 同步入口内部 `asyncio.run()` 跑异步逻辑
+- `app/worker/celery_app.py` 的 `include` 列表加上这个新任务模块；`app/config.py` 新增 `agent_repo_encryption_key`/`workspace_clone_timeout_seconds` 两个配置项
+- `pyproject.toml` 新增 `cryptography==44.0.0` 依赖（`uv lock` 已重新生成）；`Dockerfile` 新增系统依赖 `git`/`openssh-client`/`ca-certificates`
+- `backend-api/app/modules/agents/models.py` 的 `output_snapshot_update_source` 字段注释补充第三个取值 `workspace_init`（T2.1 只定义了 `conversation_sync`/`emergency_fallback` 两种）
+- `.env.example` 补充 `WORKSPACE_CLONE_TIMEOUT_SECONDS` 说明及 `AGENT_REPO_ENCRYPTION_KEY` 被 agent-runner 复用的提示
+- 新增 3 个测试文件（`test_workspace_archive.py`/`test_workspace_git_ops.py`/`test_workspace_task.py`，共 11 个用例）
+
+**关键决策与偏差**：
+- 详见已回写到 [TASKS.md](../TASKS.md) T2.3 的"决策记录"小节，要点：Runner 侧 DB 访问延续 T0.3 health check 建立的 `asyncpg` 原生 SQL 模式而非引入第二套 SQLAlchemy ORM；`token` 鉴权把凭证明文拼进 https URL netloc，`ssh_key` 鉴权把私钥写临时文件用完即删且用 `GIT_SSH_COMMAND` 注入；clone 失败的 git stderr 会先脱敏（替换掉凭证明文）才写入 `Agent.status_message`；快照内仓库目录名基于 URL basename sanitize + 去重后缀；MinIO object key 是 `{workspace_id}/repo-v{version}.zip`/`output-v{version}.zip`，版本号不覆盖旧对象（历史版本对象的清理和 T2.1 遗留的"Agent 删除不清理 MinIO"是同一类未解决问题，本任务同样没有处理）；整个 clone+打包+上传+写快照元信息包在一个 try/except 里，任何失败都不会产生部分快照记录或部分上传对象，本地打包全程发生在 `tempfile.TemporaryDirectory()` 里保证这一点；任务本身天然幂等（重复触发只产生新版本号），"重试"入口留给 T2.4 接 UI，不需要 Runner 侧新增代码
+- Windows 开发环境下 `shutil.rmtree` 删 `.git` 目录会因为 git 对象文件只读属性报错，加了 `onerror` 回调清除只读位再重试删除（这个修复同时也让代码在容器/Linux 环境下更健壮，虽然那边通常不会触发这个分支）
+
+**遗留问题**：
+- 与 T2.1 一致的已知遗留：Agent 删除仍然只删 Postgres 行，不清理 MinIO 里的仓库快照/输出快照对象（这次是真的会产生对象了，之前 T2.1 时 MinIO 里还没有东西）；旧版本号对应的快照对象也不会在写入新版本后被清理——这两类"MinIO 对象生命周期管理"问题目前都还没有任务认领，后续需要找个任务（可能是 T2.4 或更后面的运维任务）补上
+- `token` 鉴权方式假设的是"把 token 塞进 URL 就能免密 clone"这种主流托管商都支持的约定（GitHub PAT/GitLab 都可以），没有做成"按域名适配不同托管商的具体拼接格式"（比如 GitLab 惯用 `oauth2:<token>@`），v1 先用最通用的 `<token>@host` 格式，如果后续有具体托管商拼接格式不兼容的报告，再针对性调整 `git_ops._inject_token`
+- 只验证了 `auth_type=none` 的 clone 路径（本地临时仓库），`token`/`ssh_key` 两种鉴权方式的 clone 逻辑本身有单元测试覆盖（`_inject_token`），但没有对着真实私有仓库做端到端验证（沙箱环境没有可用的私有仓库/token 可测）
+- 定时刷新（T3.x）目前完全没有实现，`agent_repositories.last_synced_at`/`last_synced_commit` 只会在"创建 Agent 触发初始化"或"手动重试初始化"时更新一次，不会自动保持最新
+
+**给下一个任务的建议**：
+- T2.4（Agent 状态管理与展示）：状态流转的后端部分本任务已经完整实现（`initializing`→`ready`/`failed`，`status_message` 已经在失败时写入可读的中文错误信息），T2.4 只需要做前端轮询 + "失败状态下调用 `trigger_workspace_init` 重新触发"这个按钮，不需要改动 Runner 或 backend-api 代码
+- T3.2（仓库刷新任务）落地时，`agent-runner/app/workspace/` 下的 `db.py`/`git_ops.py`/`archive.py`/`storage.py` 都可以直接复用——刷新逻辑本质是"针对已有 Agent 的仓库重新跑一遍 clone+打包+上传"，只是不需要同时处理输出快照（仓库刷新只更新 `repo_snapshot_*`，`output_snapshot_*` 保持不变），可以考虑把 `_clone_and_pack` 里 clone+打包这部分抽出来给两边共用，但也不必现在就抽象，等 T3.2 实际写的时候看是否真的重复再决定
+- 如果后续要实现"Agent 删除时清理 MinIO 对象"，需要同时清理 `workspace_snapshots` 表里记录的当前版本对象，以及所有历史版本对象（历史版本号目前没有在任何地方被索引/列出，可能需要用 `mc`/MinIO SDK 的 `list_objects` 按 `{workspace_id}/` 前缀整体删除，而不是只删表里记的那一个 key）
+- 验证方式：`uv run pytest`（agent-runner 目录下，新增 11 个用例全部通过，加上原有 2 个共 13 个）；`docker compose build/up agent-runner` 后用 `curl` 走了创建 Agent → 观察状态自动流转到 `ready`/`failed` → 检查 MinIO 对象（用一次性 `minio/mc` 容器 `mc ls`/`mc cp` 出来再用 Python `zipfile` 校验内部目录结构）→ 检查 Postgres `workspace_snapshots`/`agent_repositories` 字段的完整链路，覆盖了 TASKS.md 三条验收标准（单仓库成功、不可达仓库失败、双仓库各自独立目录），验证完删除了这三个测试 Agent 并清理了对应的 MinIO 对象

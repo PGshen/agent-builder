@@ -337,6 +337,18 @@
 - 绑定了不可访问仓库的 Agent，任务失败后 Agent 状态正确反映失败，且提供的重试能重新触发同样的初始化流程
 - 绑定多个仓库时，快照包含所有仓库各自独立的目录
 
+**决策记录**（实现时落地）：
+- **Runner 侧数据库访问方式**：不引入 SQLAlchemy ORM（那是 backend-api 的模型/迁移职责，两边各自维护一套 ORM 模型有同步负担），沿用 T0.3 `app/server/health.py` 已经建立的 `asyncpg` 原生连接 + 手写 SQL 模式（新增 `agent-runner/app/workspace/db.py`），字段名与 backend-api `app/modules/agents/models.py` 表结构保持一致；Celery 任务本身是同步函数，内部用 `asyncio.run()` 跑一段 async 逻辑（DB/MinIO 都是 async 接口），不引入 Celery 的 asyncio 任务支持
+- **仓库凭证解密**：Runner 新增 `agent_repo_encryption_key` 配置项（`agent-runner/app/config.py`），复用 backend-api 已有的同名环境变量 `AGENT_REPO_ENCRYPTION_KEY`（两侧 `env_file` 都指向同一个 `.env`，不需要额外配置同步机制），`agent-runner/app/workspace/crypto.py::decrypt_credential` 只做解密（加密仍然只发生在 backend-api 保存仓库配置时）；agent-runner 新增 `cryptography==44.0.0` 依赖
+- **auth_type 三种取值的 clone 方式**：`none` 直接 clone；`token` 把解密后的凭证明文拼进 https URL 的 netloc（`https://<token>@host/...`，适配 GitHub/GitLab 等主流托管的 PAT 约定）；`ssh_key` 把解密后的私钥内容写入一个仅当前 clone 调用期间存在的临时文件（0600 权限），通过 `GIT_SSH_COMMAND` 环境变量让 git 使用它，用完（含异常路径）立即删除。凭证只在 `git_ops.clone_repository` 这一次调用栈内以明文形式短暂存在；clone 失败时 git 输出的 stderr 会先做一次字符串替换脱敏（把凭证明文替换成 `***`）再写入 `Agent.status_message`，避免凭证明文泄露到会被前端展示的字段里
+- **仓库目录命名与快照打包结构**：`agent-runner/app/workspace/git_ops.py::repo_dir_name` 取 URL 最后一段（去掉 `.git`）做 sanitize（非 `[A-Za-z0-9_.-]` 字符替换成 `_`），结果为空则回退成 `repo-{position}`；同名冲突（如两个不同域名但 basename 相同的仓库）追加 `-2`/`-3` 后缀。打包时压缩包内路径固定是 `repos/<repo-dir-name>/...`（`agent-runner/app/workspace/archive.py::zip_directory`），clone 完成后立即删除每个仓库的 `.git` 目录再打包——仓库在 workspace 里只读展示，不需要保留完整版本历史/对象库，也避免快照体积随 git 历史膨胀
+- **MinIO object key 与版本号规则**：`{workspace_id}/repo-v{version}.zip` / `{workspace_id}/output-v{version}.zip`（`agent-runner/app/workspace/storage.py`），版本号取当前 `workspace_snapshots` 表里记录的版本 +1（首次初始化时表里还没有该 Agent 的行，版本按 0 处理，所以首次落地是 v1）；与 Skill 版本历史的"新增而不覆盖旧对象"风格一致，`workspace_snapshots` 表用 `INSERT ... ON CONFLICT (agent_id) DO UPDATE` upsert 最新版本号和 object_key（旧版本号对应的 MinIO 对象不删除，只是不再被引用，比照 T2.1 遗留问题——Agent 删除时机的 MinIO 清理仍未处理，这里同样不处理历史版本对象的清理）
+- **`output_snapshot_update_source` 补充第三个取值 `workspace_init`**：T2.1 定义该字段时只写了 `conversation_sync`/`emergency_fallback`（T4.4）两种，本任务产生的是"初始化生成的空快照"，语义上不属于这两种，回写补充了第三个取值，`backend-api/app/modules/agents/models.py` 的字段注释已同步更新
+- **失败判定与重试**：整个 `_run()` 用一个 try/except 包住"clone 所有仓库 + 打包 + 上传 + 写快照元信息"这一整段——任何一个仓库 clone 失败（`git_ops.WorkspaceInitError`，包含地址不可达、鉴权失败、超时）或任何未预期异常，都直接把 `Agent.status` 置为 `failed` 并把原因写进 `status_message`，不会写入任何 `workspace_snapshots` 记录，也不会上传任何 MinIO 对象——本地打包发生在 `tempfile.TemporaryDirectory()` 里，只有全部仓库都 clone 成功才会执行打包/上传步骤，天然保证"整体失败、不留部分产物"。任务本身不做重试（Celery `max_retries` 用默认值 0），"重试"是指同一个任务可以被安全地重复触发（T2.1 已实现的 `trigger_workspace_init` 直接复用即可，T2.4 负责接一个"重试"按钮调用它）——重复触发只会产生新版本号的快照，不依赖上一次的中间状态，天然幂等
+- **单个仓库 clone 超时**：新增 `WORKSPACE_CLONE_TIMEOUT_SECONDS`（默认 300 秒）配置项，超时视为该仓库 clone 失败（走同样的整体失败路径）
+- **Dockerfile 补充系统依赖**：`agent-runner/Dockerfile` 新增 `apt-get install git openssh-client ca-certificates`（bookworm-slim 基础镜像不带这些，clone https/ssh 仓库都需要）
+- 验证方式：`uv run pytest`（新增 3 个测试文件共 11 个用例：`test_workspace_archive.py` 打包逻辑、`test_workspace_git_ops.py` 目录命名/token 注入/对本地临时仓库做真实 clone 的成功与失败路径、`test_workspace_task.py` 用 mock 掉 db/git_ops/storage 验证 Celery 任务在成功/clone失败/agent不存在 三种场景下的状态流转与"失败时不写快照"）；`docker compose build/up agent-runner` 后跑了三条真实链路验证：① 单仓库（容器内临时 git 仓库，`auth_type=none`）→ Agent 状态变 `ready`，MinIO 出现 `repo-v1.zip`（296B，内含 `repos/test-repo/README.md` 等）与 `output-v1.zip`（22B 空 zip），`agent_repositories.last_synced_commit` 与仓库实际 HEAD 一致；② 不可达仓库（`https://example.invalid/...`）→ Agent 状态变 `failed`，`status_message` 含 git 报错信息，`workspace_snapshots` 无记录；③ 双仓库 Agent → 两个仓库各自独立同步、各自 commit 正确记录，`repo-v1.zip` 内同时包含 `repos/test-repo/` 与 `repos/test-repo-2/` 两个独立目录。验证完清理了新建的三个测试 Agent 及其 MinIO 快照对象
+
 ---
 
 ### T2.4 Agent 状态管理与展示

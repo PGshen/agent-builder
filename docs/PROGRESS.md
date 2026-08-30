@@ -2,7 +2,7 @@
 
 > 状态取值：未开始 / 进行中 / 已完成 / 阻塞。每个任务的目标、关键实现决策、验收标准见 [TASKS.md](./TASKS.md)（ID 一一对应）。开发过程中如决策有调整，先回到 [PRD.md](./PRD.md) / [TECH_DESIGN.md](./TECH_DESIGN.md) 更新，再回来改任务内容。
 
-最后更新：2026-08-30（T2.2 Agent Builder 前端页面交互优化后）
+最后更新：2026-08-30（T2.3 Workspace 初始化任务完成后）
 
 ## Phase 0：基础设施与骨架
 
@@ -30,7 +30,7 @@
 |---|---|---|---|
 | T2.1 | Agent Service | 已完成 | 详见 HANDOFF.md 对应记录 |
 | T2.2 | Agent Builder 前端页面 | 已完成 | 详见 HANDOFF.md 对应记录 |
-| T2.3 | Workspace 初始化任务 | 未开始 | |
+| T2.3 | Workspace 初始化任务 | 已完成 | 详见 HANDOFF.md 对应记录 |
 | T2.4 | Agent 状态管理与展示 | 未开始 | |
 
 ## Phase 3：仓库定时刷新

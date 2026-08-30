@@ -94,5 +94,6 @@ class WorkspaceSnapshot(Base):
     output_snapshot_object_key: Mapped[str | None] = mapped_column(String(512), nullable=True)
     output_snapshot_version: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     output_snapshot_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    # conversation_sync（对话执行完成后正常同步） / emergency_fallback（异常退出兜底保存，T4.4）
+    # workspace_init（T2.3 初始化产生的空快照） / conversation_sync（对话执行完成后正常同步）
+    # / emergency_fallback（异常退出兜底保存，T4.4）
     output_snapshot_update_source: Mapped[str | None] = mapped_column(String(32), nullable=True)

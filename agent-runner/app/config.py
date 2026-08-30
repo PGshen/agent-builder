@@ -35,6 +35,12 @@ class Settings(BaseSettings):
     # Workspace clone/快照合并期间使用的本地临时磁盘路径（本任务只预留配置项，不含 workspace 逻辑）
     runner_local_cache_dir: str = "./.cache/agent-runner"
 
+    # Agent 绑定仓库鉴权凭证（auth_credential）的对称加密密钥，与 backend-api 共用同一个值
+    # （T2.1 决策：独立于 MCP_ENCRYPTION_KEY 的专属密钥），Runner 侧用它解密后才能 clone 私有仓库
+    agent_repo_encryption_key: str = ""
+    # 单个仓库 clone 的超时时间（秒），超时视为该仓库 clone 失败，整体 workspace 初始化任务标记失败
+    workspace_clone_timeout_seconds: int = 300
+
     @property
     def postgres_dsn(self) -> str:
         return (
