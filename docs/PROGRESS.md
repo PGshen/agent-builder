@@ -2,7 +2,7 @@
 
 > 状态取值：未开始 / 进行中 / 已完成 / 阻塞。每个任务的目标、关键实现决策、验收标准见 [TASKS.md](./TASKS.md)（ID 一一对应）。开发过程中如决策有调整，先回到 [PRD.md](./PRD.md) / [TECH_DESIGN.md](./TECH_DESIGN.md) 更新，再回来改任务内容。
 
-最后更新：2026-08-31（T4.2 Agent 互斥锁完成后）
+最后更新：2026-08-31（T4.3 真实 SDK 端到端验证补充后）
 
 ## Phase 0：基础设施与骨架
 
@@ -46,7 +46,7 @@
 |---|---|---|---|
 | T4.1 | SessionStore Adapter | 已完成 | 详见 HANDOFF.md 对应记录（`sdk_sessions` 表结构重新设计为复合主键，adapter 落在 agent-runner） |
 | T4.2 | Agent 互斥锁（Redis） | 已完成 | 详见 HANDOFF.md 对应记录（`agent-runner/app/locks/agent_lock.py`，短 TTL + 后台续期，db 2） |
-| T4.3 | Agent Runner 流式执行接口 | 未开始 | |
+| T4.3 | Agent Runner 流式执行接口 | 已完成 | 详见 HANDOFF.md 对应记录（`POST /agents/{agent_id}/execute`，SSE 流式，cwd/add_dirs 分离仓库与输出；已用真实 API Key 跑通端到端：执行→resume→输出快照同步→并发 409） |
 | T4.4 | 异常退出兜底保存 | 未开始 | |
 | T4.5 | Conversation Service | 未开始 | |
 

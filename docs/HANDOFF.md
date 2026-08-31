@@ -84,3 +84,53 @@ Phase 0（T0.1~T0.5）、Phase 1（T1.1~T1.5）、Phase 2（T2.1~T2.4）、Phase
 - **T4.3（Runner 流式执行接口）** 落地时，用 `async with AgentLock(agent_id) as lock:` 包住"拉取 workspace → 组装 SDK 参数 → 调用 SDK 执行 → 同步输出快照回 MinIO"这一整段（覆盖 T4.4 异常退出兜底保存也要在这个 `async with` 块内，退出时无论正常/异常锁都会被释放），在路由层 `except AgentBusyError as e:` 转成 HTTP 409（或类似"资源被占用"语义的状态码）响应
 - `AgentLock` 构造时可传 `redis_client=` 复用已有连接（测试里这么用，避免每个用例各自新建/关闭连接、可能导致的连接数堆积）；T4.3 如果单次进程内会频繁创建/销毁 `AgentLock` 实例，可以考虑在 Runner 启动时建一个全局共享的 Redis client 传进去，本任务默认行为（不传时自己 `aioredis.from_url` 新建、退出时自己 `aclose()`）够用，不强制
 - 验证方式：`uv run pytest tests/test_agent_lock.py -v`（`agent-runner/` 目录下，需要本地 `docker compose up -d redis` 已在跑，5 个用例全过）；`uv run pytest`（`agent-runner/` 目录下全量 36 个用例全过，含 T4.1 的 31 个 + 本次新增 5 个）
+
+## [T4.3] Agent Runner 流式执行接口 —— 2026-08-31
+
+**状态**：已完成（当天补充：用户提供本机 `ANTHROPIC_API_KEY`/`ANTHROPIC_BASE_URL` 后，已完成真实 SDK 端到端验证，原"遗留问题"里的这一条已解决，见文末补充记录）
+
+**完成内容**：
+- 新增 `POST /agents/{agent_id}/execute`（`agent-runner/app/server/execute.py`，已在 `app/server/main.py` 注册路由），body `{prompt, resume_session_id}`，响应 `text/event-stream`，把 SDK 消息实时转成 SSE 事件流推送
+- 新增 `agent-runner/app/execution/` 模块：`context.py`（读 Agent 执行期上下文：workspace 快照版本、绑定的 skills/MCP、权限模式，Agent 未就绪时抛 `AgentNotReadyError`）、`workspace_cache.py`（本地热缓存准备，命中/未命中判断精确到仓库/输出/每个 Skill）、`sdk_options.py`（组装 `ClaudeAgentOptions`）、`mcp_crypto.py`（MCP 配置解密）、`output_sync.py`（执行完成后把输出目录打包同步回 MinIO + 回写 `workspace_snapshots`）
+- `agent-runner/app/workspace/storage.py` 新增 `get_workspace_object`/`get_skill_object`（下载 MinIO 对象）；`archive.py` 新增 `extract_zip`（解压到目录，先清空避免残留陈旧文件）、`zip_directory_flat`（以打包目录本身为基准的扁平打包，供输出快照使用，区别于仓库快照用的 `zip_directory`）
+- `agent-runner/app/locks/agent_lock.py`（T4.2 产物）拆出 `begin_renewal()`/`end_renewal()`/`close()` 三个公开方法，供本任务在路由层手动接管锁的生命周期（不能简单套 `async with`，因为拿不到锁时要能在开始 SSE 流之前就返回 HTTP 409），`async with` 用法保持不变
+- `agent-runner/app/config.py` 新增 `mcp_encryption_key` 配置项（`.env.example` 同步更新注释，说明 agent-runner 也会读取 `MCP_ENCRYPTION_KEY`）
+- 新增测试：`tests/test_execute_endpoint.py`（4 个，真实本地 Redis）、`tests/test_workspace_cache.py`（4 个）、`tests/test_workspace_archive.py`（新增 4 个）、`tests/test_execution_context.py`（5 个，真实本地 Postgres）
+
+**关键决策与偏差**：
+- 已回写到 [TASKS.md](../TASKS.md) T4.3 的"决策记录"小节，核心要点（详见该文档，这里只列标题）：① SSE 事件契约与"拿锁失败/Agent 未就绪直接走普通 HTTP 4xx、不进 SSE 流"；② `cwd`=输出目录、`add_dirs`=仓库目录（两者不合并，对应 TECH_DESIGN 4.4 第 5 步 additionalDirectories），Skill 各自独立目录传给 `skills` 参数；③ `SessionStore` `project_key` 不显式传递、靠 SDK 从 `cwd` 路径自动派生，**推翻了 T4.1 handoff 里"project_key 建议用 str(agent_id)"的建议**（SDK 实际不支持显式指定，该建议不成立）；④ 本地热缓存命中判断粒度拆到仓库/输出/每个 Skill 独立；⑤ 锁的生命周期跨越整个 SSE 流（`finally` 块统一处理同步+释放，覆盖正常/异常/客户端断开三种退出路径）；⑥ 输出快照用新增的 `zip_directory_flat`（扁平打包）而不是仓库快照用的 `zip_directory`（父目录基准打包），两者解压后的目录层级语义不同，不能混用
+- **本任务不处理 SIGTERM 等进程级优雅关闭**——T4.4 的范围；本任务的 `finally` 块只覆盖"单次 HTTP 请求内的正常完成/SDK 异常/客户端主动断开连接"这三种路径，不覆盖"Runner 进程本身被信号终止导致所有正在进行的请求一起中断"这种场景（这种场景下 `finally` 会不会执行、Redis 连接来不来得及释放锁，取决于进程终止的方式，T4.4 需要专门处理）
+
+**遗留问题**：
+- ~~未验证真实 SDK 执行~~ **已在当天补充验证解决**，见文末"[T4.3 补充] 真实 SDK 端到端验证"记录
+- **`skills=[...] or None`**（`sdk_options.py`）：没有绑定任何 Skill 时传 `None` 而不是空列表——这是照着 SDK 类型标注 `list[str] | Literal["all"] | None` 里"有列表用列表，没有传 None"的直觉写的，但 SDK 对"空列表"和"None"两种取值在实际行为上是否有差异（比如空列表是不是等价于"不加载任何 skill 包括默认的"）没有去读 SDK 源码/文档细究，如果后续发现行为不对，这里是第一个该检查的地方
+- 与 T4.1/T4.2 一致：Runner 每次数据库/MinIO 操作都是独立连接（`asyncpg.connect`/MinIO 同步客户端+`asyncio.to_thread`），没有连接池；`execute` 接口如果未来发现高并发下连接数成为瓶颈，需要专门评估
+
+**给下一个任务的建议**：
+- **T4.4（异常退出兜底保存）** 要在本任务的基础上加"进程级"的信号处理钩子：收到 SIGTERM 时，遍历当前进程内所有正在进行的 `_execute_stream` 生成器（目前没有一个全局注册表跟踪它们），强制触发一次输出快照同步——这意味着 T4.4 可能需要给 `_execute_stream` 加一个模块级的"当前正在执行的任务"注册表，本任务没有预留这个结构，需要补
+- **T4.5（Conversation Service）** 是本任务的真正调用方（backend-api 侧）：需要处理"Backend API 收到前端 SSE 连接 → 直连调用 Runner 这个 `execute` 接口 → 把 Runner 的 SSE 流原样转发/包装后再转发给前端"，以及"从 `ResultMessage` 事件里提取 `session_id` 持久化到 `conversation_id → session_id` 映射"这两件事；Runner 副本的选择（负载均衡）依赖 compose 服务名 DNS 轮询（TECH_DESIGN 6），T4.5 落地时用普通 HTTP 客户端对 `agent-runner:{AGENT_RUNNER_HTTP_PORT}` 发请求即可，不需要额外的服务发现逻辑
+- 验证方式：`uv run pytest`（`agent-runner/` 目录下全量 52 个用例全过，含此前 36 个 + 本次新增 16 个）；`uv run python -c "from app.server.main import app"` 确认路由能正常加载（无循环 import/依赖缺失）；本地 `docker compose up -d postgres redis minio` 均已在跑的前提下跑通了 `test_execution_context.py`（真实 Postgres）和 `test_execute_endpoint.py`/`test_agent_lock.py`（真实 Redis），`test_workspace_cache.py`/`test_workspace_archive.py` 纯本地文件系统 + monkeypatch 不依赖外部服务
+
+## [T4.3 补充] 真实 SDK 端到端验证 —— 2026-08-31
+
+**状态**：已完成
+
+**背景**：用户在本机 `~/.zshrc` 配置好了 `ANTHROPIC_API_KEY`/`ANTHROPIC_BASE_URL`（注意：这两个变量只在交互式 shell 里通过 `source ~/.zshrc` 生效，agent 工具的非交互 Bash 会话默认读不到，每次起新进程前都要显式 `source ~/.zshrc`），要求补做 T4.3 完成时遗留的"真实 SDK 调用"验证。
+
+**完成内容**（跑完即清理，仓库里没有留下任何验证脚本/临时文件）：
+1. 起了真实的 `uv run uvicorn app.server.main:app --host 127.0.0.1 --port 8100` 进程（后台）
+2. 用一次性脚本直接往真实本地 Postgres/MinIO 插入了一个临时 Agent（`permission_mode='acceptEdits'`，`status='ready'`）+ 空的仓库快照/输出快照（`workspace_id` 前缀 `e2e-`，与正式业务用的 `ws-` 前缀区分，避免和已有测试数据混淆）
+3. `curl -N POST /agents/{id}/execute` 发第一次真实请求（prompt 要求在当前目录创建 `hello.txt`），收到真实的 `SystemMessage(init)` → `AssistantMessage`（工具调用）→ ... → `ResultMessage` 完整 SSE 流，拿到真实 `session_id`
+4. 带着上一步的 `session_id` 通过 `resume_session_id` 发第二次请求，模型确认记得上下文并成功在 `cwd` 内创建了 `hello.txt`（`本地缓存目录/output/hello.txt` 内容正确）
+5. 下载 MinIO 里回写的 `output-v3.zip`，解压确认内容是 `hello.txt`，`workspace_snapshots.output_snapshot_version` 正确从 1 递增到 3（两次执行各 +1）
+6. 并发对同一 Agent 发两个 `execute` 请求，验证第二个立刻拿到 `409 {"detail": "Agent ... 正忙，请稍后再试"}`（不排队），第一个正常执行完成
+7. 执行结束后确认 Redis 里 `agent_lock:*` 无残留 key
+8. 清理：`DELETE FROM agents WHERE id = ...`（级联清了 `workspace_snapshots`）、MinIO 删除该 workspace 下 5 个测试对象（`output-v1~v4.zip` + `repo-v1.zip`）、删除本地缓存目录 `.cache/agent-runner/e2e-.../`，停掉 uvicorn 进程；跑完全量 `uv run pytest` 确认 52 个用例仍然全过（本次验证不涉及代码改动，纯运行时验证）
+
+**关键发现**（已回写到 [TASKS.md](../TASKS.md) T4.3 决策记录，非代码 bug）：
+- 第一次请求模型没有把文件写到 SDK 配置的 `cwd`，而是尝试写绝对路径 `/Users/peng/Me/Ai/agent-builder/hello.txt`（我们自己这个项目仓库的根目录），被 SDK 自带的 `workingDir` 权限检查正确拦截（`permission_denied`）——**这恰恰证明了 T4.3 组装的 `cwd`/`add_dirs` 沙箱边界生效**，不是安全问题。根因是本地开发时 `RUNNER_LOCAL_CACHE_DIR` 落在 `agent-runner/` 这个真实 git 仓库内部，`claude` CLI 子进程会向上找 `.git`/`CLAUDE.md` 识别"项目根"，找到的是 `agent-builder` 仓库根而不是我们指定的深层 output 目录，导致模型对"当前项目"的路径认知出现偏差。生产部署（cache 目录挂在独立 volume，不在任何 git 仓库内）不会有这个问题；把 prompt 改成明确要求相对路径后，模型第二次就正确执行了
+
+**给下一个任务的建议**：
+- 以后如果要在本地（而不是容器里）复现"最贴近生产"的验证效果，建议把 `RUNNER_LOCAL_CACHE_DIR` 临时指到仓库外的目录（如 `/tmp/agent-runner-cache`），避免 `claude` CLI 的项目根探测跟我们自己的开发仓库产生干扰
+- **T4.4/T4.5** 落地后建议也各自补一次同样方式的真实端到端验证（复用本次这套"插入临时 Agent → 起服务 → curl 验证 → 清理"的流程），尤其 T4.4 的 SIGTERM 兜底保存，mock 测试很难覆盖"进程真的被信号杀死那一刻数据是否写完整"这种时序敏感的场景
+- 环境提醒：这台机器上 `ANTHROPIC_API_KEY`/`ANTHROPIC_BASE_URL` 只在 `~/.zshrc` 里，agent 工具默认的非交互 Bash 不会自动加载，每次需要真实调用 SDK 的验证前都要 `source ~/.zshrc`（或在起服务的那条命令里一并 source）

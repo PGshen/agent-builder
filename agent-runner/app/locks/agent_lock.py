@@ -110,15 +110,15 @@ class AgentLock:
         except Exception:
             logger.exception("agent_lock_renew_failed", agent_id=str(self._agent_id))
 
-    async def __aenter__(self) -> "AgentLock":
-        if not await self.acquire():
-            if self._owns_client:
-                await self._redis.aclose()
-            raise AgentBusyError(self._agent_id)
-        self._renew_task = asyncio.create_task(self._renew_loop())
-        return self
+    def begin_renewal(self) -> None:
+        """启动后台续期协程。供调用方在 `acquire()` 成功后手动接管生命周期时使用（比如 T4.3 流式执行接口：
+        锁需要在拿到 HTTP 409 之前就确定获取成败，但续期/释放要跟着整个流式响应的生命周期走，
+        不能简单套一层 `async with`）。`__aenter__` 内部也是调这个方法，行为完全一致。"""
 
-    async def __aexit__(self, exc_type, exc, tb) -> None:
+        if self._renew_task is None:
+            self._renew_task = asyncio.create_task(self._renew_loop())
+
+    async def end_renewal(self) -> None:
         if self._renew_task is not None:
             self._renew_task.cancel()
             try:
@@ -126,8 +126,21 @@ class AgentLock:
             except asyncio.CancelledError:
                 pass
             self._renew_task = None
+
+    async def close(self) -> None:
+        if self._owns_client:
+            await self._redis.aclose()
+
+    async def __aenter__(self) -> "AgentLock":
+        if not await self.acquire():
+            await self.close()
+            raise AgentBusyError(self._agent_id)
+        self.begin_renewal()
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        await self.end_renewal()
         try:
             await self.release()
         finally:
-            if self._owns_client:
-                await self._redis.aclose()
+            await self.close()

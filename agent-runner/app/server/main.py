@@ -5,6 +5,7 @@ from fastapi import FastAPI
 from app.cache import ensure_local_cache_dir
 from app.config import get_settings
 from app.logging_config import configure_logging, get_logger
+from app.server.execute import router as execute_router
 from app.server.health import router as health_router
 
 settings = get_settings()
@@ -21,7 +22,7 @@ async def lifespan(app: FastAPI):
 
 
 # 流式执行服务入口（TECH_DESIGN 4.4：Backend API 直连调用）。
-# 本任务只搭骨架 + 健康检查，SDK 调用/workspace 拉取合并逻辑见 T4.3。
 app = FastAPI(title="AgentBuilder Agent Runner", lifespan=lifespan)
 
 app.include_router(health_router)
+app.include_router(execute_router)

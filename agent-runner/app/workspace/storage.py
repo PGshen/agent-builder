@@ -50,3 +50,25 @@ def _put_object_sync(object_key: str, data: bytes) -> None:
 
 async def put_workspace_object(object_key: str, data: bytes) -> None:
     await asyncio.to_thread(_put_object_sync, object_key, data)
+
+
+def _get_object_sync(bucket: str, object_key: str) -> bytes:
+    response = get_minio_client().get_object(bucket, object_key)
+    try:
+        return response.read()
+    finally:
+        response.close()
+        response.release_conn()
+
+
+async def get_workspace_object(object_key: str) -> bytes:
+    settings = get_settings()
+    return await asyncio.to_thread(_get_object_sync, settings.minio_bucket_workspaces, object_key)
+
+
+async def get_skill_object(object_key: str) -> bytes:
+    """T4.3 组装 workspace 时需要拉取 Agent 绑定 Skill 的 zip 内容，复用同一个 MinIO 客户端，
+    只是 bucket 换成 backend-api `app/modules/skills/storage.py` 用的那个（`minio_bucket_skills`）。"""
+
+    settings = get_settings()
+    return await asyncio.to_thread(_get_object_sync, settings.minio_bucket_skills, object_key)
