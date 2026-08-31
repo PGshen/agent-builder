@@ -21,9 +21,15 @@ class Settings(BaseSettings):
     redis_host: str = "localhost"
     redis_port: int = 6379
     redis_password: str = ""
-    # Celery broker/result backend 各用独立 db index，与后续 T4.2 的 Agent 互斥锁（预留 db 2）分开，避免 key 混用
+    # Celery broker/result backend 各用独立 db index，与 T4.2 的 Agent 互斥锁（db 2）分开，避免 key 混用
     celery_broker_db: int = 0
     celery_result_db: int = 1
+    agent_lock_db: int = 2
+
+    # Agent 互斥锁：单次续期后的存活时长；持锁方每隔 renew_interval 续期一次，
+    # ttl 需明显大于 renew_interval，避免网络抖动导致续期还没到就已经过期被别的请求抢走
+    agent_lock_ttl_seconds: int = 60
+    agent_lock_renew_interval_seconds: int = 20
 
     minio_host: str = "localhost"
     minio_port: int = 9000
@@ -63,6 +69,10 @@ class Settings(BaseSettings):
     @property
     def celery_result_backend(self) -> str:
         return self._redis_url(db=self.celery_result_db)
+
+    @property
+    def agent_lock_redis_url(self) -> str:
+        return self._redis_url(db=self.agent_lock_db)
 
     @property
     def minio_endpoint(self) -> str:

@@ -11,6 +11,7 @@
 | Phase 0（基础设施与骨架，T0.1~T0.5） | [handoff-archive/phase0-2026-08-29.md](./handoff-archive/phase0-2026-08-29.md) | 2026-08-29 | T0.1 Docker Compose、T0.2 Backend API 骨架（+ uv 迁移补充）、T0.3 Agent Runner 骨架、T0.4 前端骨架（+ pnpm/shadcn 补充）、T0.5 登录鉴权 |
 | Phase 1（元数据管理：Skill / MCP，T1.1~T1.5） | [handoff-archive/phase1-2026-08-30.md](./handoff-archive/phase1-2026-08-30.md) | 2026-08-30 | T1.1 数据模型与迁移、T1.2 Skill Service（+ 版本历史补充）、T1.3 Skill 管理前端页面（+ 抽屉/嵌套树/新建目录补充）、T1.4 MCP Service（加密+脱敏）、T1.5 MCP 管理前端页面 |
 | Phase 2（Agent 构建器与 Workspace 初始化，T2.1~T2.4） | [handoff-archive/phase2-2026-08-30.md](./handoff-archive/phase2-2026-08-30.md) | 2026-08-30 | T2.1 Agent Service（+ PUT 编辑仓库自动重新触发初始化补丁）、T2.2 Agent Builder 前端页面（+ 交互优化补充：抽屉/能力描述字段/穿梭器）、T2.3 Workspace 初始化任务、T2.4 Agent 状态管理与展示（轮询+失败重试） |
+| Phase 3（仓库定时刷新，T3.1~T3.2） | [handoff-archive/phase3-2026-08-31.md](./handoff-archive/phase3-2026-08-31.md) | 2026-08-31 | T3.1 Scheduler 服务（Celery beat，+ 跨服务队列路由修复）、T3.2 仓库刷新任务（+ 无更新时跳过快照写入补丁） |
 
 ## 记录模板
 
@@ -35,76 +36,51 @@
 
 ---
 
-Phase 0（T0.1~T0.5）、Phase 1（T1.1~T1.5）、Phase 2（T2.1~T2.4）均已全部完成并归档，见上方归档索引。当前进入 Phase 3（仓库定时刷新）。
+Phase 0（T0.1~T0.5）、Phase 1（T1.1~T1.5）、Phase 2（T2.1~T2.4）、Phase 3（T3.1~T3.2）均已全部完成并归档，见上方归档索引。当前进入 Phase 4（对话执行核心链路）。
 
-## [T3.1] Scheduler 服务（Celery beat） —— 2026-08-30
-
-**状态**：已完成
-
-**完成内容**：
-- 新增独立服务 `scheduler/`（`uv` 管理，目录结构比照 backend-api/agent-runner 但没有 FastAPI/HTTP 业务 API）：
-  - `app/config.py` —— Postgres/Redis 连接配置 + `scheduler_scan_interval_seconds`（默认 60）/`scheduler_dispatch_lock_ttl_seconds`（默认 600）/`scheduler_lock_db`（独立 redis db 4，不与 agent-runner 的 Celery broker/result db 0/1、`AUTH_REDIS_DB`=3、T4.2 预留的 db 2 混用）
-  - `app/db.py` —— `fetch_ready_agents_repo_sync_status()`，`asyncpg` 原生 SQL 查所有 `status='ready'` 且绑定了仓库的 Agent，及其名下仓库 `last_synced_at` 的 `MIN`
-  - `app/due.py` —— 纯函数 `is_due(status, now)`，不依赖数据库连接，方便单测
-  - `app/dispatch_lock.py` —— `try_acquire_dispatch_lock(agent_id)`，Redis `SET NX EX` 实现的派发去重锁
-  - `app/celery_app.py` —— 内嵌 `beat_schedule`（一条固定周期任务 `scheduler.scan_due_agents`，路由到专属队列 `"scheduler"`）
-  - `app/tasks.py` —— `scan_due_agents` 任务本体：查状态 → 逐个判断到期 → 抢锁成功才 `send_task("workspace.refresh_repos", args=[agent_id], queue="agent-runner")`
-  - `entrypoint.sh` —— `celery -A app.celery_app worker --beat --loglevel=info -Q scheduler`（单进程内嵌 beat，不需要独立 beat 容器）
-  - `tests/`（11 个用例）—— `test_due.py`（到期判断：NULL 兜底、边界值、MIN 口径）、`test_dispatch_lock.py`（内存假 Redis 验证 NX+TTL 语义）、`test_tasks.py`（到期/未到期/被锁定三种场景的派发行为，`task_always_eager` 模式）
-- `docker-compose.yml` 新增 `scheduler` service（依赖 postgres/redis healthy，健康检查用 `celery inspect ping` 而非 HTTP `/health`）；`.env`/`.env.example` 补充三个新配置项；`Makefile` 的 `APP_SERVICES`/`install`/`local-up`/`local-down` 加入 scheduler，新增 `local-scheduler` 前台调试目标
-- **落地过程中发现并修复一个跨服务的 Celery 路由 bug**（详见下方"关键决策与偏差"）：`agent-runner/entrypoint.sh` 和 `backend-api/app/modules/agents/tasks.py::trigger_workspace_init` 各改了一行
-
-**关键决策与偏差**：
-- 详见已回写到 [TASKS.md](../TASKS.md) T3.1 的"决策记录"小节，要点：用"固定间隔扫描 + 到期判断"取代"每个 Agent 一条 beat schedule 条目"（避免引入 `django-celery-beat` 之类的额外基础设施，且能让用户改了某个 Agent 的刷新周期后无需重启即可在下一轮扫描生效）；到期判断用 Agent 名下所有仓库 `last_synced_at` 的 **MIN**（不是 MAX），保证不会有某个仓库长期滞后被掩盖；刷新期间**不**把 Agent 状态改成 `initializing`（对应 PRD"刷新独立于对话执行、不影响可用性"的既定策略，这点和 `workspace.init` 的行为刻意不同）；用 Redis `SET NX EX` 做派发去重锁，锁不要求 T3.2 的刷新任务主动清除，TTL 到期自动兜底
-- **实现时才暴露的问题，超出预先写好的决策范围**：scheduler 上线前，`backend-api`（生产者）→ `agent-runner`（消费者）一直是"一对一"的任务流转，共用 Celery 默认队列 `"celery"` 从没出过问题；但 scheduler 的 worker 一上线，就和 agent-runner 的 worker 变成两个同时监听同一个默认队列的消费者——本地 `docker compose up` 联调时立刻复现：`agent-runner` 日志报 `Received unregistered task of type 'workspace.refresh_repos'`（消息被 agent-runner 收到但没注册这个任务名，直接丢弃，不重新入队）。说明如果不显式分队列，`workspace.init` 这类任务本来就有被 scheduler 的 worker 意外抢走并丢弃的风险，只是此前只有 agent-runner 一个消费者，从没暴露过。**修复**：`agent-runner` 只监听队列 `"agent-runner"`，`scheduler` 只监听队列 `"scheduler"`（各自 `entrypoint.sh`/`Makefile` 加 `-Q` 参数），三处 `send_task`/`beat_schedule` 都补上显式 `queue="agent-runner"`（`scheduler/app/tasks.py`、**回头修正 T2.1 的** `backend-api/app/modules/agents/tasks.py::trigger_workspace_init`）或 `queue="scheduler"`（`scheduler/app/celery_app.py` 的 `beat_schedule` options）。这个修复不改变 T2.1/T2.3 已验收的行为，纯粹是让隐式共享队列变成显式路由，消除竞态——**下一个引入新 Celery worker 的任务（如果有）要记得同样显式指定 `-Q`/`queue=`，不要依赖默认队列**
-
-**遗留问题**：
-- **`workspace.refresh_repos` 目前没有任何消费者**（T3.2 还没实现）：`agent-runner` 会收到这个任务但因为没注册而直接丢弃（不是排队等待，是真正丢失）。这跟 T2.1→T2.3 之间"`workspace.init` 排队等待"的空档期不同——因为现在 agent-runner 的 worker 已经在监听 `"agent-runner"` 队列，会主动消费到这条消息再发现自己不认识。T3.2 上线前，scheduler 派发的每一次刷新实际上都是无效的（不会有任何副作用，只是浪费一次 broker 往返），不影响任何数据正确性，但也意味着"仓库到期没有真的被刷新"，需要 T3.2 尽快跟进
-- 数据库里遗留的测试 Agent（`76bcc309-9334-4c91-a69f-bd46cb14b267`，T2.1 补丁记录里提到的"问题排查"）状态是 `ready` 且早已过期未同步，验证期间被 scheduler 真实扫描到并按 10 分钟一次的节奏持续派发（受派发锁 TTL 限制），这是预期行为、不是 bug，但如果不想让它继续产生日志噪音，可以手动清理这个 Agent 或等 T3.2 落地后它会被正常刷新
-- 与 T2.1/T2.3 一致的已知遗留仍未解决：Agent/仓库快照相关的 MinIO 对象生命周期管理（删除清理、历史版本清理）本任务没有涉及，因为 T3.1 本身不产生任何 MinIO 对象
-
-**给下一个任务的建议**：
-- **T3.2（仓库刷新任务）**：Runner 侧要注册 `@celery_app.task(name="workspace.refresh_repos")`，参数 `agent_id`（str）——契约已经在跑，上线即生效（不需要 backend-api/scheduler 那边改任何代码）。**队列层面不需要改动**：agent-runner 的 worker 已经在监听 `"agent-runner"` 队列（T3.1 落地时加的 `-Q agent-runner`），新任务在同一个进程里注册即可被消费，不用单独配置
-- T2.3 交接记录建议过"可以把 `_clone_and_pack` 里 clone+打包这部分抽出来给 init/refresh 两边共用"，本任务没有动 `agent-runner/app/workspace/` 下的任何代码（T3.1 是纯 scheduler 侧的工作），这个抽象留给 T3.2 视实际情况决定是否要做
-- T3.2 要留意 TASKS.md T3.2 原有的验收标准之一"一次对话执行期间触发刷新，不会相互阻塞或报错"——本任务的 scheduler 派发逻辑本身已经不依赖、不等待 Agent 互斥锁（T4.2 还没实现），刷新是否真的和对话执行无冲突，要等 T3.2 的具体 clone/打包实现 + T4.2 落地后才能完整验证
-- 验证方式：`uv run pytest`（`scheduler/` 目录下，新增 11 个用例全过）；`uv run pytest`（`backend-api/` 目录下，`queue="agent-runner"` 改动后 21 个用例回归全过）；`docker compose build/up backend-api agent-runner scheduler` 后用数据库里真实存在的一个过期未同步的 ready Agent 观察了完整链路：`scheduler` 按 60 秒周期扫描 → 到期后派发（`scheduler_dispatch_refresh` 日志）→ 确认消息 `routing_key` 是 `"agent-runner"` 而非共享的 `"celery"` → 下一轮扫描被派发锁跳过（`scheduler_dispatch_skipped_locked`）→ 手动 `redis-cli -n 4 DEL` 清锁后确认能立即重新派发。全程未新建/删除任何测试数据（用的是数据库里已有的旧 Agent），未清理 broker 队列消息（T3.2 上线前这些消息本来就会被 agent-runner 当 unregistered task 丢弃，不会累积、不会被将来的 T3.2 worker 消费到脏数据）
-
----
-
-## [T3.2] 仓库刷新任务 —— 2026-08-30
+## [T4.1] SessionStore Adapter —— 2026-08-31
 
 **状态**：已完成
 
 **完成内容**：
-- `agent-runner/app/worker/tasks/refresh.py`（新增）：`@celery_app.task(name="workspace.refresh_repos")`，消费 T3.1 已经在跑的 `"workspace.refresh_repos"` 任务。逻辑上是 `workspace.init`（T2.3）的裁剪版——`load_agent_context` 拿到 Agent 名下全部仓库 → 逐个 `git_ops.clone_repository` → `archive.zip_directory` 打包 → `storage.put_workspace_object` 上传新版本仓库快照 → 只更新 `workspace_snapshots` 的 `repo_snapshot_*` 三列，**全程不调用 `mark_agent_status`**（不像 init 那样把 Agent 打成 initializing/ready/failed），也不touch `output_snapshot_*`
-- `agent-runner/app/workspace/db.py` 新增两个函数：`update_repo_snapshot(agent_id, repo_snapshot_object_key, repo_snapshot_version)`（只 UPDATE 仓库快照三列，不是 UPSERT——刷新时该行必然已存在）、`update_repository_sync_error(repo_id, error_message)`（只写 `last_sync_error`，不动 `last_synced_at`/`last_synced_commit`）；`update_repository_sync_info`（init/refresh 共用）顺带在成功时清空 `last_sync_error`
-- **backend-api 新增字段** `agent_repositories.last_sync_error`（Text，nullable）承载"记录失败信息"：`app/modules/agents/models.py` 加列、`schemas.py` 的 `AgentRepositoryDetail` 加字段、`router.py` 构造处补上、新增 Alembic 迁移 `backend-api/alembic/versions/7c2a4e1f9b3d_agent_repository_last_sync_error.py`（`down_revision` 接在 T2.1 补丁的 `dbf10ea831f1` 之后）
-- `agent-runner/app/worker/celery_app.py` 的 `include` 列表加上 `"app.worker.tasks.refresh"`
-- 新增测试 `agent-runner/tests/test_workspace_refresh_task.py`（后续被"补丁"小节重写为 6 个用例，见下方）
+- **`sdk_sessions` 表结构重新设计**（T1.1 落地的旧结构在本任务之前没有任何写入代码路径，直接 drop/recreate，不涉及数据迁移）：`backend-api/app/modules/sessions/models.py` 改为复合主键 `(project_key, session_id, subpath)` + `agent_id`（FK CASCADE）+ `entries`（JSONB 数组）+ `mtime_ms`（BigInteger）；新增迁移 `backend-api/alembic/versions/9d3b6a2c1e4f_sdk_sessions_composite_key.py`（`down_revision` 接在 T3.2 的 `7c2a4e1f9b3d` 之后）
+- `backend-api/app/modules/sessions/__init__.py` 的注释改写，说明这个目录只保留 schema/迁移职责，真正的 adapter 实现在 agent-runner
+- **新增 `agent-runner/app/sessions/store.py`**：`PostgresSessionStore` 类，duck-typed 实现 Claude Agent SDK 的 `SessionStore` Protocol——必需方法 `append`/`load`，外加可选方法 `list_sessions`/`delete`/`list_subkeys`（`list_session_summaries` 未实现，未定义在类上，见决策记录）。`agent-runner/pyproject.toml` 新增依赖 `claude-agent-sdk==0.2.144`（仅用于导入 SDK 定义的 TypedDict 做类型标注，本任务不实际调用 SDK 执行）
+- 新增测试 `agent-runner/tests/test_sessions_store.py`（9 个用例，用内存假 asyncpg 连接，不需要真实数据库）
 
 **关键决策与偏差**：
-- 已回写到 [TASKS.md](../TASKS.md) T3.2 的"决策记录"小节，要点见上方，核心是：**直接复用 T2.3 的 `git_ops.py`/`archive.py`/`storage.py`/`crypto.py`/`AgentInitContext`/`load_agent_context`，不做额外抽象**——T2.3 交接记录建议过"可以把 clone+打包抽出来共用"，但实际写下来发现刷新任务本身已经足够薄（`_clone_and_pack` 只是去掉了 output 快照那部分），复用现有函数即可，不需要再抽一层
-- **`last_sync_error` 是本任务新增的字段**，TASKS.md 原文"记录失败信息"没写清楚落在哪——Agent 表的 `status_message` 语义上绑定 Agent 整体状态，而刷新决策要求不碰 Agent 状态，所以选了仓库级新字段，粒度对得上"是哪个仓库刷新失败"。这是超出任务描述原文、但没有冲突现有决策的补充，已回写 TASKS.md
-- **多仓库场景是全有全无（all-or-nothing）**：任意一个仓库 clone 失败，整轮刷新放弃、不落新版本快照，只把失败原因记到那一个出错的仓库上，跟它一起"陪跑"的其它仓库自身 `last_sync_error`/`last_synced_at` 不受影响（它们没有出错，只是所在的这轮刷新被回滚）。这个是延续 T2.3 `workspace.init` 的"整体失败不做部分成功"策略做的选择，TASKS.md 原文没有明确要求 all-or-nothing 还是逐仓库独立提交，做了个和 T2.3 一致的决定
+- 已回写到 [TASKS.md](../TASKS.md) T4.1 的"决策记录"小节，要点见上方"完成内容"，核心增量决策（原任务描述没覆盖、实现时才发现）：SDK 的 `SessionKey` 是 `{project_key, session_id, subpath}` 三元组而非单纯 `session_id`；adapter 代码归属判定为 agent-runner（不是 backend-api）而非任务描述里未明确的选择——理由是 SDK 在 agent-runner 进程内被调用，`sessionStore` 必须以 Python 对象形式传给同进程的 `ClaudeAgentOptions`
+- `append` 的 upsert/去重语义（带 `uuid` 的条目按幂等键去重，没有 `uuid` 的不去重）严格照抄 SDK 官方文档要求（`claude_agent_sdk/types.py` 里 `SessionStore.append` 的 docstring），不是本任务自行发明的行为
+- **本任务不实际调用 SDK 执行对话**（那是 T4.3 的范围），只交付 adapter 本身；`project_key` 具体传什么值（大概率是 `str(agent_id)`）留给 T4.3 在组装 SDK 参数时决定，本任务的 `PostgresSessionStore.__init__` 只固定 `agent_id`（落 FK 列用），不对 `project_key` 的取值做任何假设或校验
 
 **遗留问题**：
-- TASKS.md T3.2 第三条验收标准"一次对话执行期间触发刷新，不会相互阻塞或报错"**仍未完整验证**：T4.2（Agent 互斥锁）还没实现，本任务只能确认刷新任务本身不 touch 任何对话执行相关的状态/锁，理论上不会冲突，但没有真正跑一次"对话执行中触发刷新"的并发场景。留给 T4.2 落地后补验证
-- `agent_repositories.last_sync_error` 目前只有后端字段和 API 暴露，**前端没有展示**（Agent 详情页目前只展示 Agent 级 `status_message`）。留给 T5.x 或有需要时再加，不阻塞当前任务
-- 与历次任务一致的已知遗留：MinIO 历史快照对象（`repo-v1.zip`/`repo-v2.zip`/…）没有清理机制，刷新越多、历史版本堆积越多，仍未解决
+- `list_session_summaries`（对话列表页可能需要的增量摘要）v1 未实现——依赖 SDK 内部 `fold_session_summary` 帮助函数，且要求"`append` 内部维护摘要的读-改-写必须串行化（事务/CAS/per-session 锁）"，复杂度和当前验收标准不匹配，留给 T5.1（对话页面前端）如果真的需要摘要列表时再补
+- 与历次任务一致：`sdk_sessions` 表没有任何清理机制（比如废弃很久的 session），MinIO 快照的历史版本清理问题在本任务里也依然没有涉及（本任务不产生 MinIO 对象）
+- 验证时发现本地开发环境此前从未跑起来过完整的 docker compose 基础设施（`.env` 不存在、Docker Desktop 未启动、MinIO bucket 未初始化）——本次验证过程中补齐了这些（复制 `.env.example` 为 `.env`，在 `backend-api/`、`agent-runner/`、`scheduler/` 三个目录各建了指向根 `.env` 的符号链接，跑了一次 `docker compose up -d postgres redis minio` + `minio-init`），不是本任务的功能变更，但如果之前的任务都是纯 mock 验收、从没连过真实基础设施，这次补齐的本地环境可以直接复用给后续任务
 
 **给下一个任务的建议**：
-- Agent 互斥锁（T4.2）落地时，可以直接对照本任务"刷新读写不冲突"的设计假设做验证：刷新只新增 MinIO 对象、只在最后一步整体切换 `workspace_snapshots` 指针，旧版本对象在切换前始终可读，理论上不需要跟对话执行的互斥锁产生任何交互
-- 验证方式：`uv run pytest`（`agent-runner/` 目录下，17 个用例全过，新增 4 个）；`uv run pytest`（`backend-api/` 目录下，`uv run alembic upgrade head` 应用新迁移后 21 个用例全过）；`docker compose build backend-api agent-runner` + `up -d` 重建镜像后用真实容器链路验证：① 创建一个绑定真实仓库 `https://github.com/PGshen/chat-web.git`、`repo_refresh_interval_minutes=1` 的 Agent，等 T2.3 `workspace.init` 跑完到 `ready`（`repo-v1.zip`）；② 等 scheduler 到期派发 `workspace.refresh_repos`（60 秒扫描周期内自动触发，未手动构造消息），确认 `workspace_refresh_succeeded` 日志、MinIO 新增 `repo-v2.zip`、`workspace_snapshots.repo_snapshot_version` 变成 2 且 `output_snapshot_version`/`output_snapshot_object_key` 原样不动、`agent_repositories.last_synced_at` 更新、`last_sync_error` 为空；③ 把仓库 URL 改成不存在的地址、手动清掉 Redis 派发锁触发立即重试，确认 `workspace_refresh_failed` 日志、`workspace_snapshots` 仍停在 v2（未产生 v3、未覆盖已有对象）、`agent_repositories.last_synced_at`/`last_synced_commit` 保持刷新前的值不变、`last_sync_error` 写入了脱敏后的 git 报错信息、Agent `status` 全程是 `ready`（未被打成 failed）；验证完删除了测试 Agent 并清理了对应的 3 个 MinIO 对象（`repo-v1.zip`/`repo-v2.zip`/`output-v1.zip`）
+- **T4.2（Agent 互斥锁）** 和 **T4.3（Runner 流式执行接口）** 都会用到本任务的 `PostgresSessionStore`：T4.3 组装 `ClaudeAgentOptions` 时 `session_store=PostgresSessionStore(agent_id=...)`，`project_key` 建议直接用 `str(agent_id)`（简单够用，除非后续有更细的多租户划分需求）
+- `PostgresSessionStore` 的每个方法都是独立 `asyncpg.connect()`/`close()`（不是连接池），跟 `agent-runner/app/workspace/db.py` 现有模式一致；T4.3 如果单次对话执行里会高频调用 `append`（SDK 文档：~100ms 一批），可以考虑评估是否需要换成连接池，本任务按现有代码库约定先保持一致，没有做这个优化
+- 验证方式：`uv run pytest`（`agent-runner/` 目录下 31 个用例全过，新增 9 个）；`uv run pytest`（`backend-api/` 目录下，`uv run alembic upgrade head` 应用新迁移后 21 个用例全过）；额外用真实 Postgres 跑了端到端脚本验证（插入真实 `agents` 行 → append 两批含重复 uuid → load 验证去重合并 → subpath 隔离主/子 transcript → list_sessions/list_subkeys 正确 → **换一个全新的 adapter 实例 load 同一个 key，确认能读到同样内容**，对应验收标准"换一个 Runner 副本 resume" → 删除 agents 行确认 FK CASCADE 清理了对应 sdk_sessions 记录），验证完清理了脚本内创建的临时 Agent（脚本自身在最后一步已经删除，无需额外清理）
 
-### 补丁：仓库无更新时跳过快照写入 —— 2026-08-30
+## [T4.2] Agent 互斥锁（Redis）—— 2026-08-31
 
-**背景（用户在验收时发现的问题）**：上面这版实现里 `_clone_and_pack` 无条件执行——只要到达刷新周期就重新 clone、打包、上传一份新版本 zip、`repo_snapshot_version` 无脑 +1，哪怕仓库自上次同步后完全没有新提交。长期不更新的仓库会在每个刷新周期都产生一份内容和上一版完全相同的快照，MinIO 存储和 `workspace_snapshots` 版本号会无意义膨胀，跟 TASKS.md 决策"独立版本化"的本意（版本号应该反映真实变更）不符。
+**状态**：已完成
 
-**修复**：刷新前先做一次轻量的"有没有更新"检查，只有真的有变化才重新 clone+打包+上传。
-- `agent-runner/app/workspace/git_ops.py` 新增 `remote_head_commit(repo) -> str`，用 `git ls-remote <url> <branch-or-HEAD>` 只查询远程当前指向的 commit，不下载任何内容；把 `clone_repository` 里原本内联的凭证准备逻辑（token 拼 URL / ssh_key 落临时文件 + `GIT_SSH_COMMAND`）抽成 `_prepared_auth` 上下文管理器，`clone_repository` 和 `remote_head_commit` 共用，避免重复
-- `agent-runner/app/workspace/db.py` 的 `RepositoryRecord` 新增 `last_synced_commit: str | None = None` 字段，`load_agent_context` 的 SQL 一并 SELECT 出来（之前这个查询只取 clone 需要的字段，没取这一列）
-- `agent-runner/app/worker/tasks/refresh.py` 的 `_run` 改成两阶段：先 `_resolve_remote_commits` 对每个仓库跑 `remote_head_commit` 拿到远程当前 commit；**如果全部仓库的远程 commit 都等于各自的 `last_synced_commit`，直接返回 `"unchanged"`**——跳过 `_clone_and_pack`，但仍然对每个仓库调用 `update_repository_sync_info(repo_id, 远程commit)` 把 `last_synced_at` 刷新到当前时间（commit 值不变，只是时间戳前进）；只要有一个仓库的远程 commit 变了，才走原来的整体重新 clone+打包+上传流程（快照是全部仓库的组合 zip，没有做单仓库增量更新的粒度）。远程查询本身失败（仓库不可达）跟原来 clone 失败一样处理：整体放弃，把失败原因记到 `last_sync_error`
-- **`last_synced_at` 在"无变化"分支也必须推进**是这次修复里容易漏掉的一点：如果跳过打包时完全不写库，这个 Agent 的 `last_synced_at` 停留在上一次真正变更的时间，下一次 scheduler 扫描（默认 60 秒一次）会立刻又判定它"到期"、重新派发，变成事实上每 60 秒都要查一次远程，架空了用户在 Agent 上配置的 `repo_refresh_interval_minutes`
-- 测试：`agent-runner/tests/test_workspace_refresh_task.py` 重写为 6 个用例（新增"远程无变化时跳过 clone+打包但推进 last_synced_at"、"远程查询本身失败时不进入 clone 阶段"两个）；`agent-runner/tests/test_workspace_git_ops.py` 新增 3 个 `remote_head_commit` 的真实本地仓库用例（正确返回 HEAD、能感知新提交、仓库不可达时报 `WorkspaceInitError`）
+**完成内容**：
+- 新增 `agent-runner/app/locks/agent_lock.py`：`AgentLock` 类（异步上下文管理器）+ `AgentBusyError` 异常。key 格式 `agent_lock:{agent_id}`，独立 Redis db 2（`agent_lock_db`，`config.py` 里 T0.3/T3.1 时期就已预留的注释这次真正落地）
+- `agent-runner/app/config.py` 新增 `agent_lock_db`（默认 2）、`agent_lock_ttl_seconds`（默认 60）、`agent_lock_renew_interval_seconds`（默认 20）三个配置项，以及 `agent_lock_redis_url` property
+- 新增测试 `agent-runner/tests/test_agent_lock.py`（5 个用例，用本地真实 Redis，不 mock）
 
-**验证方式**：`uv run pytest`（`agent-runner/` 目录下 22 个用例全过）；`docker compose build/up agent-runner` 重建镜像后用真实容器链路验证：创建一个绑定 `https://github.com/PGshen/chat-web.git`、`repo_refresh_interval_minutes=1` 的新 Agent，等 `workspace.init` 完成（`repo-v1.zip`）→ 等 scheduler 到期自动派发刷新（未手动触发）→ 确认日志是 `workspace_refresh_unchanged`（不是 `workspace_refresh_succeeded`）→ 确认 `workspace_snapshots.repo_snapshot_version` 仍是 1、MinIO 里没有出现 `repo-v2.zip`、`agent_repositories.last_synced_at` 确实推进到了刷新发生的时间点、`last_synced_commit` 不变；验证完删除了测试 Agent 并清理了对应的 2 个 MinIO 对象（`repo-v1.zip`/`output-v1.zip`）
+**关键决策与偏差**：
+- 已回写到 [TASKS.md](../TASKS.md) T4.2 的"决策记录"小节，要点：① 锁代码放在 agent-runner（不是 backend-api），理由与 T4.1 的 `PostgresSessionStore` 一致——要覆盖的执行发生在 Runner 进程内；② 获取锁失败不排队、立刻抛 `AgentBusyError`，对应验收标准"明确得知 Agent 正忙而不是排队卡住"；③ 短 TTL（60s）+ 持锁期间后台 `asyncio.Task` 每 20s 续期一次，而不是获取时设一个覆盖最长可能执行时间的长 TTL——执行时长不可预知，长 TTL 会让进程真崩溃时锁悬挂太久；④ 释放/续期都用 Lua 脚本做"校验 token 匹配后再操作"的原子 check-and-act，避免误删/误续别人已经抢到的新锁
+- 本任务只交付 `AgentLock`/`AgentBusyError` 两个可复用构件本身，**没有接入任何 HTTP 路由**——因为 T4.3（Runner 流式执行接口）还不存在，没有真实的调用方。`agent-runner/app/server/main.py` 未改动
+
+**遗留问题**：
+- 锁本身没有暴露"当前是否被占用/被谁占用"的查询接口（比如给前端展示"Agent 正在对话中"状态用）——当前验收标准只要求"发起执行时能明确得知正忙"，没有要求旁路查询；如果 T5.1 对话页面需要这种状态展示，需要另外加一个只读的 `GET` 查询方法（直接 `redis.get(key)` 判断是否存在即可，不需要新决策）
+- 续期失败（`_renew_loop` 里 `renewed` 为假，意味着锁在续期前就已经被判定过期/被人抢占）目前只记一条 `warning` 日志然后让续期协程退出，不会主动中断持锁方正在执行的业务逻辑（比如强行取消 T4.3 的 SDK 调用）——这种"锁丢了但业务还在跑"的极端情况（正常续期间隔 20s 远小于 TTL 60s，理论上只有 Redis 本身不可用/网络分区超过 40s 才会触发）本任务没有处理，T4.3/T4.4 落地时如果要做得更严格（比如续期失败后主动 cancel 执行任务），需要在那两个任务里补
+
+**给下一个任务的建议**：
+- **T4.3（Runner 流式执行接口）** 落地时，用 `async with AgentLock(agent_id) as lock:` 包住"拉取 workspace → 组装 SDK 参数 → 调用 SDK 执行 → 同步输出快照回 MinIO"这一整段（覆盖 T4.4 异常退出兜底保存也要在这个 `async with` 块内，退出时无论正常/异常锁都会被释放），在路由层 `except AgentBusyError as e:` 转成 HTTP 409（或类似"资源被占用"语义的状态码）响应
+- `AgentLock` 构造时可传 `redis_client=` 复用已有连接（测试里这么用，避免每个用例各自新建/关闭连接、可能导致的连接数堆积）；T4.3 如果单次进程内会频繁创建/销毁 `AgentLock` 实例，可以考虑在 Runner 启动时建一个全局共享的 Redis client 传进去，本任务默认行为（不传时自己 `aioredis.from_url` 新建、退出时自己 `aclose()`）够用，不强制
+- 验证方式：`uv run pytest tests/test_agent_lock.py -v`（`agent-runner/` 目录下，需要本地 `docker compose up -d redis` 已在跑，5 个用例全过）；`uv run pytest`（`agent-runner/` 目录下全量 36 个用例全过，含 T4.1 的 31 个 + 本次新增 5 个）

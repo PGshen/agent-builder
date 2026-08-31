@@ -436,6 +436,15 @@
 - 新建对话产生的 session 数据能正确写入 Postgres，字段可查询
 - 换一个 Runner 副本用同一个 session_id 发起 resume，能正确续接此前的对话上下文
 
+**决策记录**（实现时落地，2026-08-31）：
+- **`sdk_sessions` 表结构在本任务重新设计**：T1.1 落地时只按 `session_id` 单列做主键；本任务查阅 SDK 实际的 `SessionStore` Protocol（`claude_agent_sdk.types.SessionStore`，pip 包 `claude-agent-sdk`）才发现 `SessionKey` 是 `{project_key, session_id, subpath}` 三元组——`subpath`（如 `subagents/agent-{id}`）用来区分主会话与子代理各自独立的 transcript，同一 `session_id` 下会有多行。因为该表在 T1.1 之后到本任务之前没有任何写入代码路径（纯 schema 先行），直接用新迁移 drop/recreate（`backend-api/alembic/versions/9d3b6a2c1e4f_*.py`），不需要数据迁移。新结构：复合主键 `(project_key, session_id, subpath)`（`subpath` 主会话为空串 `''`，不用 NULL——NULL 在复合唯一约束下语义不稳定）、`agent_id`（FK CASCADE，用于 Agent 删除时级联清理，与 `project_key` 取值含义无关，是 adapter 实例化时由调用方另外传入的）、`entries`（JSONB 数组，SDK transcript 条目的不透明追加存储）、`mtime_ms`（Unix 毫秒，供 `list_sessions` 排序，同时是 `SessionStoreListEntry.mtime` 的来源）
+- **adapter 代码放在 agent-runner，不是 backend-api**：`app/modules/sessions/` 只保留 SQLAlchemy 模型（供 Alembic 迁移用）；真正实现 `SessionStore` 方法的 `PostgresSessionStore` 类落在 `agent-runner/app/sessions/store.py`。原因：SDK 是在 agent-runner 进程内被调用的（T4.3），`sessionStore` 要以 Python 对象形式传给 `ClaudeAgentOptions`，必须和 SDK 调用同进程；backend-api 没有理由持有这个对象。`agent-runner` 新增 `claude-agent-sdk==0.2.144` 依赖（仅用于导入 `SessionKey`/`SessionStoreEntry` 等 TypedDict 做类型标注，不在本任务实际调用 SDK 执行——那是 T4.3 的范围）
+- **duck-typed Protocol，只实现必需 + 部分可选方法**：`append`/`load` 是 SDK 唯一要求的必需方法；`list_sessions`/`delete`/`list_subkeys` 一并实现（前端 T5.1 对话列表、Agent 删除级联、resume 时发现子代理 transcript 都用得到）；`list_session_summaries` 依赖 SDK 内部 `fold_session_summary` 帮助函数维护增量摘要，v1 不实现，未定义在类上（SDK 用 `hasattr` 探测方法是否存在，而不是 `isinstance`，所以不能定义成 `raise NotImplementedError` 占位——那样会被探测成"已实现"）
+- **`append` 的 upsert 语义**：按 SDK 文档要求，带 `uuid` 字段的条目视为幂等键，重复 `append` 相同 `uuid` 的条目不重复落盘；没有 `uuid` 的条目（如 title/tag/mode marker）直接追加不去重。实现上用 `SELECT ... FOR UPDATE` 锁行读出现有 `entries` 数组、在 Python 里做去重合并、再整体 `UPDATE` 写回（而不是用 Postgres jsonb 原地追加运算符）——因为去重逻辑（按 `uuid` 判断是否已存在）用纯 SQL 表达比较绕，entries 数组单次 `append` 批量通常很小（SDK 文档：~100ms 一批），整体读改写的开销可接受
+- **`project_key` 的取值由调用方（T4.3）决定，本任务不下决策**：`PostgresSessionStore.__init__(agent_id)` 只固定 `agent_id`（用于落 FK 列），`project_key` 是每次调用时通过 `SessionKey` 参数传入的，T4.3 组装 SDK 参数时会决定具体传什么值（大概率是 `str(agent_id)`，但留给 T4.3 决定，不在本任务里预设）
+
+**验证方式**：`uv run pytest`（`agent-runner/` 目录下 31 个用例全过，新增 9 个 `test_sessions_store.py`，用内存假 asyncpg 连接验证 append/load 往返、按 uuid 去重、无 uuid 不去重、subpath 隔离主/子会话、list_sessions 排除 subpath 条目、delete 主 key 级联子 key、delete 单个 subpath 只删自己、空 entries 是 no-op）；`uv run pytest`（`backend-api/` 目录下，`uv run alembic upgrade head` 应用新迁移后 21 个用例全过）；额外用真实 Postgres（`docker compose up -d postgres redis minio` + `minio-init`）跑了一遍端到端脚本验证：插入一个真实 `agents` 行 → `PostgresSessionStore.append` 两批（含重复 uuid）→ 验证 `load` 返回去重后的合并结果 → 验证 `subpath` 隔离（主 transcript 与 `subagents/agent-x` 各自独立）→ 验证 `list_sessions`/`list_subkeys` 返回正确 → **用一个全新的 adapter 实例**（模拟另一个 Runner 副本）`load` 同一个 key，确认能读到同样内容（验证跨主机 resume 能力对应的验收标准）→ 删除该 `agents` 行，确认 `sdk_sessions` 里对应记录被 FK CASCADE 一并清理（0 行残留）
+
 ---
 
 ### T4.2 Agent 互斥锁（Redis）
@@ -449,6 +458,15 @@
 **验收标准**：
 - 对同一 Agent 并发发起两次对话请求，第二个请求能明确得知"Agent 正忙"而不是排队卡住或报未知错误
 - 模拟持锁进程异常崩溃（不主动释放锁），验证锁能在过期时间后自动释放，不会永久卡死该 Agent
+
+**决策记录**（实现时落地，2026-08-31）：
+- **锁代码放在 agent-runner，不是 backend-api**：与 T4.1 的 `PostgresSessionStore` 同样的理由——锁要覆盖的是 T4.3 里 SDK 在 Runner 进程内的一次完整执行，获取/续期/释放都要发生在同一个执行流程里，backend-api 没有必要间接持有这把锁；`agent-runner/app/locks/agent_lock.py`，key 用 `agent_lock:{agent_id}`，独立 Redis db 2（`agent_lock_db`，`config.py` 沿用 T0.3/T3.1 已经预留的注释）
+- **不做成"排队等待"，直接快速失败**：`AgentLock` 是异步上下文管理器（`async with AgentLock(agent_id): ...`），`__aenter__` 内部只 `SET key token NX PX ttl` 尝试一次，拿不到立刻抛 `AgentBusyError`（带 `agent_id` 属性），不做重试/阻塞等待——对应验收标准"明确得知 Agent 正忙而不是排队卡住"的字面要求，调用方（T4.3 的 HTTP 接口）捕获这个异常后直接返回"Agent 正忙"的响应
+- **短 TTL + 后台续期，而不是"获取时设一个覆盖最长可能执行时间的长 TTL"**：单次对话执行时长不可预知（依赖 SDK 侧模型调用/工具执行），长 TTL 设多长都可能不够，而且会让"进程真的崩溃"场景的锁悬挂窗口变得很长。改成默认 TTL 60s（`agent_lock_ttl_seconds`）+ 持锁期间每 20s（`agent_lock_renew_interval_seconds`）用一个后台 `asyncio.Task` 续期一次；执行多久就续期多久，正常退出时取消续期任务并主动释放；进程崩溃时续期任务随进程消失，锁在最后一次续期后最多 60s 内自动过期——对应验收标准"过期时间后自动释放"
+- **释放/续期都用 Lua 脚本做"校验 token 匹配后再操作"的原子 check-and-act**（而不是先 `GET` 再 `DEL`/`PEXPIRE` 两步），每把锁持有一个 `uuid4().hex` token：避免 A 的锁已经过期、B 已经抢到新锁之后，A 才姗姗来迟地续期/释放，把 B 的锁给续期/删除了
+- 未在 T4.3 之前提供实际的 HTTP 调用入口（T4.3 还没实现），本任务只交付 `AgentLock`/`AgentBusyError` 这两个可复用的构件，T4.3 组装执行流程时用 `async with AgentLock(agent_id) as lock:` 包住"拉取 workspace → 调 SDK → 同步输出快照"整段逻辑，`AgentBusyError` 在 T4.3 的路由层捕获并转成对调用方明确的"Agent 正忙"响应（如 HTTP 409）
+
+**验证方式**：`uv run pytest tests/test_agent_lock.py`（`agent-runner/` 目录下，用真实本地 Redis——`docker compose up -d redis` 已在跑，5 个用例：① 同一 Agent 并发两次 `async with AgentLock` 第二次确认抛 `AgentBusyError` 且 `agent_id` 属性正确；② 正常退出后锁释放，下一次能重新拿到；③ 上下文内抛异常退出后锁同样释放；④ 模拟崩溃——`acquire()` 后不进入 `async with`（不启动续期协程）也不释放，确认此刻仍是"正忙"，`sleep` 超过 TTL 后确认能被新请求拿到；⑤ 验证续期协程确实让锁存活时间超过初始 TTL（ttl=1s + 每 0.3s 续期一次，1.5s 后锁仍存在））；`uv run pytest`（`agent-runner/` 目录下全量 36 个用例全过，含此前 31 个 + 新增 5 个）
 
 ---
 

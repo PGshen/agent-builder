@@ -13,6 +13,7 @@ dependencies = [
     "structlog==24.4.0",
     "minio==7.2.13",
     "cryptography==44.0.0",
+    "claude-agent-sdk==0.2.144",
 ]
 
 [dependency-groups]
