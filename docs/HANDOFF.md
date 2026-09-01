@@ -134,3 +134,47 @@ Phase 0（T0.1~T0.5）、Phase 1（T1.1~T1.5）、Phase 2（T2.1~T2.4）、Phase
 - 以后如果要在本地（而不是容器里）复现"最贴近生产"的验证效果，建议把 `RUNNER_LOCAL_CACHE_DIR` 临时指到仓库外的目录（如 `/tmp/agent-runner-cache`），避免 `claude` CLI 的项目根探测跟我们自己的开发仓库产生干扰
 - **T4.4/T4.5** 落地后建议也各自补一次同样方式的真实端到端验证（复用本次这套"插入临时 Agent → 起服务 → curl 验证 → 清理"的流程），尤其 T4.4 的 SIGTERM 兜底保存，mock 测试很难覆盖"进程真的被信号杀死那一刻数据是否写完整"这种时序敏感的场景
 - 环境提醒：这台机器上 `ANTHROPIC_API_KEY`/`ANTHROPIC_BASE_URL` 只在 `~/.zshrc` 里，agent 工具默认的非交互 Bash 不会自动加载，每次需要真实调用 SDK 的验证前都要 `source ~/.zshrc`（或在起服务的那条命令里一并 source）
+
+## [T4.4] 异常退出兜底保存 —— 2026-09-01
+
+**状态**：已完成
+
+**完成内容**：
+- 新增 `agent-runner/app/execution/registry.py`：`ActiveExecution`（持有 `context`/`lock`/`cwd`，`finalize()` 做"打包上传输出快照 + 释放 Agent 互斥锁"，内部 `asyncio.Lock` + `_finalized` 标记保证幂等）+ 模块级注册表（`register`/`unregister`/`snapshot`）
+- `agent-runner/app/server/execute.py` 的 `_execute_stream` 改为开始时 `registry.register`，`finally` 块只调 `entry.finalize()` + `registry.unregister`，原来内联的打包上传/释放锁逻辑整体搬进了 `ActiveExecution.finalize()`
+- `agent-runner/app/server/main.py` 的 `lifespan` 里新增 `loop.add_signal_handler(signal.SIGTERM, ...)` 挂载 `_emergency_shutdown()`：遍历 `registry.snapshot()`，对每条记录并发 `finalize(update_source="emergency_fallback")`，最后 `os._exit(0)`
+- 新增测试：`tests/test_execution_registry.py`（4 个，覆盖 finalize 的同步+释放锁、幂等、注册/注销、cwd 为 None 时仍释放锁）、`tests/test_shutdown.py`（1 个，验证 `_emergency_shutdown` 对所有活跃记录调用 finalize 并退出进程）
+
+**关键决策与偏差**：
+- 已回写到 [TASKS.md](../TASKS.md) T4.4 的"决策记录"小节，核心要点：① 幂等靠 `ActiveExecution` 自带 `asyncio.Lock`+标记位做互斥，不复用 Redis 锁；② `_emergency_shutdown` 最后用 `os._exit(0)` 直接终止进程而不是走 uvicorn 优雅关闭——因为 `add_signal_handler` 对同一信号只能注册一个回调，注册自己的处理器会覆盖 uvicorn 内置的 SIGTERM 处理，不主动退出进程会挂住不退出；③ 明确不处理 SIGKILL/断电（TECH_DESIGN 4.5 已有局限性说明），依赖 T4.2 的 Redis 锁短 TTL 自动过期兜底
+- 与 T4.3 交接记录预告的方案一致（"给 `_execute_stream` 加一个模块级的当前正在执行的任务注册表"），没有偏离
+
+**遗留问题**：
+- 无新增遗留问题；沿用 T4.3 遗留的"Runner 每次数据库/MinIO 操作都是独立连接，没有连接池"这一条
+
+**给下一个任务的建议**：
+- **T4.5（Conversation Service）** 不需要关心本任务的信号处理细节——backend-api 侧只是普通 HTTP 客户端调用 Runner 的 `execute` 接口，Runner 进程被 SIGTERM 时会自己完成兜底同步再退出，backend-api 收到的是这次 HTTP 连接被服务端关闭（连接中断），按普通"执行异常中断"处理即可（不需要特殊区分"是不是因为 Runner 收到了 SIGTERM"）
+- 验证方式：`uv run pytest`（`agent-runner/` 目录下全量 57 个用例全过，含此前 52 个 + 本次新增 5 个）；本地起了真实 uvicorn（`RUNNER_LOCAL_CACHE_DIR` 指到仓库外目录）+ 真实 Postgres/MinIO/Redis + 真实 `ANTHROPIC_API_KEY`，对一个临时 Agent 发起真实 `execute` 请求并在执行进行中对服务进程 `kill -TERM`，确认日志按预期顺序输出（`sigterm_received` → `output_snapshot_synced[update_source=emergency_fallback]` → `emergency_shutdown_complete`）、进程退出、Redis 无残留 `agent_lock:*`、MinIO 新版本快照对象内容与终止前状态一致；验证完清理了临时 Agent 行、MinIO 测试对象、本地缓存目录
+
+## [T4.5] Conversation Service —— 2026-09-01
+
+**状态**：已完成
+
+**完成内容**：
+- 新增 backend-api `app/modules/conversations/` 三个文件：`service.py`（`create_conversation`/`get_conversation`，操作 T1.1 已建好的 `Conversation` 表）、`runner_client.py`（`build_client`/`open_execute_stream`，httpx 直连调用 agent-runner 的 `execute` 接口，非 200 时统一转成 `RunnerRequestError`）、`router.py`（`POST /agents/{agent_id}/conversations`、`GET /conversations/{conversation_id}`、`POST /conversations/{conversation_id}/messages`，最后一个接口做 SSE 转发 + 流结束后从 `ResultMessage` 里取 `session_id` 落库）；`app/main.py` 注册了新路由
+- `app/config.py` 新增 `agent_runner_host`/`agent_runner_http_port`/`agent_runner_connect_timeout_seconds`/`agent_runner_base_url`；`docker-compose.yml` 给 `backend-api` 服务补了 `AGENT_RUNNER_HOST: agent-runner` 环境覆盖（同其他依赖服务一致的模式：容器内用 compose 服务名代替 `.env` 里给宿主机本地开发用的 `localhost`）
+- 新增测试 `backend-api/tests/test_conversations.py`（7 个用例）
+
+**关键决策与偏差**：
+- 已回写到 [TASKS.md](../TASKS.md) T4.5 的"决策记录"小节，核心要点（详见该文档）：① **backend-api 不重复实现 Agent 互斥锁**——TECH_DESIGN 4.4 步骤 2 提到的"Conversation Service 用 Redis 对该 Agent 加互斥锁"实际上锁已经在 T4.2/T4.3 落在了 agent-runner 一侧，本任务原样透传 Runner 的 409，不新增第二把锁；② SSE 转发是手动逐行透传（httpx 流式 `aiter_lines()` 重建 `data: ...\n\n` 格式），不是简单管道字节流，因为要在中途窥探 `ResultMessage` 取 `session_id`；③ 落库延迟到流结束的 `finally` 块，不在流进行中途写，且用独立短生命周期 DB session（不复用请求最初查 conversation 时的 session，也不让一个 DB 连接跨越整个可能很久的 SSE 生命周期）
+- 这是对 TECH_DESIGN 4.4 表述的一处必要偏差（锁的归属），已经记录在 TASKS.md 决策记录里，不需要回写 TECH_DESIGN 本身（该文档只到系统级粒度）
+
+**遗留问题**：
+- `Conversation.status` 字段目前只有 `create_conversation` 时写死的 `"active"`，本任务没有定义其他状态流转（比如对话被归档/关闭）——如果 T5.1/T5.2 需要"关闭对话"之类的操作，需要另外定义状态机，本任务没有预留
+- 没有做"列出某 Agent 下所有对话"的接口（比如对话历史列表页可能需要）——T4.5 验收标准只要求"基于已有 conversation_id 续接"，没有要求列表浏览，留给 T5.1 前端落地时如果需要再补
+- 与历次任务一致：backend-api 每次调用 Runner 都是新建一个 `httpx.AsyncClient`（用完关闭），没有做连接复用/连接池；如果后续发现高并发下这里成为瓶颈需要专门评估
+
+**给下一个任务的建议**：
+- **T5.1（对话页面前端）** 直接调用本任务的三个接口即可：先 `POST /agents/{agent_id}/conversations` 拿 `conversation_id`（或者如果前端要支持"继续上次对话"，需要自己想办法记住/查出上次的 `conversation_id`——本任务没有提供"按 agent 列出历史对话"的接口，见上面遗留问题），然后对 `POST /conversations/{conversation_id}/messages` 发起 SSE 请求持续渲染；遇到 HTTP 4xx（包括 409 Agent 正忙、404 对话不存在）要在页面上给出清晰提示而不是空白/卡死，这是 T5.1 验收标准明确要求的
+- **T5.2（对外 API）** 可以直接复用这三个接口对外暴露（TASKS 原文就是这么设计的："复用 Conversation Service 的核心编排逻辑"），不需要另外包一层，只是需要补充非浏览器客户端消费 SSE 的文档说明
+- 验证方式：`uv run pytest`（backend-api 目录下全量 28 个用例全过，含此前 21 个 + 本次新增 7 个；agent-runner 目录下 57 个用例不受影响）；本地起了真实 backend-api + agent-runner + 真实 Postgres/MinIO/Redis + 真实 `ANTHROPIC_API_KEY`，对一个临时 ready Agent 走完整闭环验证：新建对话 → 发消息收到真实 SSE 流 → `session_id` 正确回写 → 带同一 conversation_id 续接（Runner 侧 `workspace_cache_hit` + `resume_session_id` 与前一轮一致）→ 执行过程中并发发消息，确认清晰收到 `409 Agent 正忙`（不阻塞不排队）且原请求不受影响正常完成。验证完清理了临时 Agent 行与 MinIO 测试对象

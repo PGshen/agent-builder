@@ -17,7 +17,7 @@ from pydantic import BaseModel
 from starlette.responses import StreamingResponse
 
 from app.execution import context as context_module
-from app.execution import output_sync, sdk_options, workspace_cache
+from app.execution import registry, sdk_options, workspace_cache
 from app.locks.agent_lock import AgentLock
 from app.logging_config import get_logger
 
@@ -56,9 +56,10 @@ async def execute(agent_id: uuid.UUID, body: ExecuteRequest) -> StreamingRespons
 
 
 async def _execute_stream(context: context_module.ExecutionContext, body: ExecuteRequest, lock: AgentLock):
-    prepared = None
+    entry = registry.register(context, lock)
     try:
         prepared = await workspace_cache.prepare_workspace(context)
+        entry.cwd = prepared.cwd
         options = sdk_options.build_options(context, prepared, resume_session_id=body.resume_session_id)
 
         async for message in query(prompt=body.prompt, options=options):
@@ -67,13 +68,8 @@ async def _execute_stream(context: context_module.ExecutionContext, body: Execut
         logger.exception("agent_execution_failed", agent_id=str(context.agent_id))
         yield _sse_event({"type": "ExecutionError", "message": str(exc)})
     finally:
-        if prepared is not None:
-            try:
-                await output_sync.sync_output_snapshot(context, prepared.cwd)
-            except Exception:  # noqa: BLE001 — 同步失败不应该阻止锁释放，否则会把 Agent 卡死
-                logger.exception("output_snapshot_sync_failed", agent_id=str(context.agent_id))
-        await lock.end_renewal()
-        try:
-            await lock.release()
-        finally:
-            await lock.close()
+        # 正常完成/SDK 异常/客户端断开都走到这里；进程被 SIGTERM 提前终止的场景由
+        # `app/server/main.py` 的信号处理器通过 `registry.snapshot()` 兜底调用 `entry.finalize()`。
+        # `entry.finalize()` 自身做了幂等处理，两边谁先执行都不会导致重复上传/重复释放锁。
+        await entry.finalize()
+        registry.unregister(entry)

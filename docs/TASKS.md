@@ -511,6 +511,13 @@
 - 在对话执行过程中人为发送可捕获的终止信号，验证 MinIO 输出快照被更新为终止前的最新状态，且 Agent 互斥锁被正确释放（不会卡死后续对话）
 - 验证正常执行完成路径和异常退出路径不会重复触发两次快照上传（幂等或互斥处理得当）
 
+**决策记录**（实现时落地）：
+- **新增 `agent-runner/app/execution/registry.py`**：模块级 `ActiveExecution` 注册表，T4.3 的 `_execute_stream` 开始时 `registry.register(context, lock)` 注册一条记录（`cwd` 字段在 workspace 准备完成后才赋值，赋值前 SIGTERM 到达也不会报错，只是没有内容可同步），正常/异常/客户端断开退出时统一走 `entry.finalize()` + `registry.unregister(entry)`；`app/server/execute.py` 原来直接内联在 `finally` 块里的"打包上传 + 释放锁"逻辑整体搬进了 `ActiveExecution.finalize()`，`_execute_stream` 自身的 `finally` 块简化为只调 `entry.finalize()`
+- **幂等靠 `ActiveExecution` 自带的 `asyncio.Lock` + `_finalized` 标记**，而不是复用 T4.2 的 Redis 锁做跨路径互斥：正常路径（HTTP 请求自身的 `finally`）和信号路径（SIGTERM 处理器遍历注册表）有可能并发调用同一条记录的 `finalize()`，`_guard` 保证只有一次真正执行"打包上传 + 释放 Redis 锁"，另一次直接返回——两条路径谁先谁后都不会重复上传/重复释放
+- **信号处理器挂在 `app/server/main.py` 的 `lifespan` 里**：`loop.add_signal_handler(signal.SIGTERM, ...)` 注册 `_emergency_shutdown()`，逻辑是"遍历 `registry.snapshot()` → 对每条记录并发 `finalize(update_source=SOURCE_EMERGENCY_FALLBACK)` → `os._exit(0)`"。**用 `os._exit(0)` 直接终止进程，不走 uvicorn 自带的优雅关闭流程**——因为 `loop.add_signal_handler` 对同一信号只能注册一个回调，注册我们自己的处理器会覆盖 uvicorn 内部的 SIGTERM 处理逻辑（它自己也是靠 `add_signal_handler` 挂载的），如果不主动退出进程会一直挂着不退出；这个取舍对应 TASKS 原文"收到信号后暂停正常流程、强制执行一次输出目录打包上传，再释放互斥锁退出"里的"退出"二字，是有意为之而不是遗漏
+- **明确不覆盖 SIGKILL/断电场景**（TECH_DESIGN 4.5 已有此局限性说明，本任务不重复展开）：这类场景进程没有机会执行任何代码，只能依赖 T4.2 已实现的 Redis 锁短 TTL（默认 60s）自动过期兜底，不会永久卡死该 Agent，但这段时间内的输出快照就是终止前最后一次正常同步的版本，无法做到"终止前最新状态"
+- 验证方式：`uv run pytest`（`agent-runner/` 目录下全量 57 个用例全过，含此前 52 个 + 本次新增 `test_execution_registry.py` 4 个 + `test_shutdown.py` 1 个）；本地起了真实 uvicorn 进程（`RUNNER_LOCAL_CACHE_DIR` 指到仓库外目录，规避 T4.3 补充记录里提到的 `claude` CLI 项目根探测干扰）+ 真实 Postgres/MinIO/Redis + 真实 `ANTHROPIC_API_KEY`，往一个临时 Agent 发起真实 `execute` 请求，执行进行中（收到 `workspace_cache_miss` 日志之后、模型输出尚未返回工具调用结果前）对服务进程发 `kill -TERM`：日志显示 `sigterm_received`（`active_executions: 1`）→ `output_snapshot_synced`（`update_source: emergency_fallback`，`version: 2`）→ `emergency_shutdown_complete`，进程随即退出；确认 Redis 里 `agent_lock:*` 无残留 key；下载 `output-v2.zip` 确认是当时输出目录的真实内容（本次因为进程在模型第一次工具调用前就被杀，内容为空 zip，符合"终止前最新状态"预期，不是 bug）。验证完清理了临时 Agent 行、MinIO 三个测试对象、本地缓存目录
+
 ---
 
 ### T4.5 Conversation Service
@@ -525,6 +532,14 @@
 - 前端发起对话请求后，能通过 SSE 收到与 Runner 执行同步的实时流式内容
 - 刷新页面或重新连接后，能基于已有 conversation_id 正确续接同一个 session
 - 对同一 Agent 并发发起两次对话，一个正常执行，另一个收到清晰的"Agent 正忙"反馈
+
+**决策记录**（实现时落地）：
+- **接口落在 backend-api 新增的 `app/modules/conversations/` 模块**：`router.py` 三个接口——`POST /agents/{agent_id}/conversations`（新建对话，`session_id` 为空）、`GET /conversations/{conversation_id}`（查询，供前端刷新页面后判断能否续接）、`POST /conversations/{conversation_id}/messages`（发一轮消息，SSE 转发）；`service.py` 只管 conversation 记录本身的增删查；`runner_client.py` 封装对 Runner `execute` 接口的 httpx 直连调用
+- **互斥锁不在 backend-api 侧重复实现**：TECH_DESIGN 4.4 步骤 2 写的是"Conversation Service 用 Redis 对该 Agent 加互斥锁"，但 T4.2/T4.3 落地时已经把这把锁做在了 agent-runner 一侧（`execute` 接口拿不到锁直接返回 HTTP 409）——backend-api 重复加一层锁没有必要，还会引入两把锁一致性的新问题（比如 backend-api 锁拿到了但 Runner 锁没拿到，或者反过来）。本任务的做法是 `runner_client.open_execute_stream` 原样透传 Runner 的状态码/detail（`RunnerRequestError` → `HTTPException`），backend-api 侧不新增任何 Redis 交互。这是对 TECH_DESIGN 表述的一处必要偏差，理由已回写到 TECH_DESIGN 不涉及（该文档只到"系统级"粒度，具体锁归属这种实现细节留给 TASKS 记录即可）
+- **SSE 转发用 httpx 流式 + 手动逐行透传**：`_forward_stream` 用 `httpx.AsyncClient(...).send(..., stream=True)` 拿到 Runner 的 `httpx.Response`，`async for line in upstream.aiter_lines(): yield f"{line}\n"` 原样重建 SSE 格式（`aiter_lines()` 会把 `data: {...}\n\n` 拆成 `"data: {...}"` 和 `""` 两行，逐行加回 `\n` 能精确重建）；边转发边用一个正则/JSON 解析检查每个 `data:` 行是不是 `type == "ResultMessage"`，是的话取出 `session_id` 暂存，流结束（`finally` 块）后才落库——不在流进行中途写库，避免半途异常导致的部分写入
+- **`session_id` 落库用独立的短生命周期 DB session**，不复用请求最初查 conversation 时用的那个：查 `agent_id`/`resume session_id` 那次用完立刻关闭（`async with session_factory() as db: ...` 出了 `with` 就关），流式转发期间及结束后落库各自开关自己的 session——避免一个 DB 连接跨越整个可能持续很久的 SSE 生命周期占着不放
+- **`Conversation.session_id` 有唯一约束**（T1.1 建表时定的），落库前判断"是否与当前值不同"才写，避免同一 session_id 重复 UPDATE 触发不必要的写操作；不同 conversation 之间不会撞 `session_id`（每次新对话在 Runner 侧都是全新 session）
+- 验证方式：backend-api 新增 `tests/test_conversations.py`（7 个用例：鉴权拦截、创建/查询 404、创建/查询成功、发消息成功转发+落库+续接用正确的 resume_session_id、Runner 返回 409 时透传、对话不存在时 404），`uv run pytest` 全量 28 个用例全过（backend-api 目录下）；agent-runner 侧无改动，57 个用例仍全过。另外起了真实 backend-api + agent-runner + 真实 Postgres/MinIO/Redis + 真实 `ANTHROPIC_API_KEY`，对一个临时 ready Agent 走完整闭环：① `POST /agents/{id}/conversations` 拿到 `session_id: null` 的新对话 → ② `POST /conversations/{id}/messages` 发第一条消息，SSE 收到真实 `SystemMessage`→`AssistantMessage`→`ResultMessage` 完整流，`GET /conversations/{id}` 确认 `session_id` 已回写 → ③ 带着同一个 `conversation_id` 再发第二条消息，日志确认 Runner 侧走的是 `workspace_cache_hit`（复用第一轮的工作目录）且传给 SDK 的 `resume_session_id` 与第一轮拿到的 `session_id` 一致 → ④ 在第二条消息执行过程中并发发第三条消息，确认立刻收到 backend-api 透传的 `409 {"detail": "Agent ... 正忙，请稍后再试"}`，不阻塞不排队，同时第二条消息正常执行完成。验证完清理了临时 Agent 行、MinIO 测试对象
 
 ---
 

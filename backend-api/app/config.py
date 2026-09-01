@@ -50,6 +50,19 @@ class Settings(BaseSettings):
     # 格式但用途独立（各模块各自的加密字段用各自的密钥，互不影响；见 T2.1 决策记录，方式与 T1.4 保持一致）
     agent_repo_encryption_key: str = "uxYa2PhAS4d5Q48cAgVZkbF_m-hRSlozCfTiuNdsxW4="
 
+    # Conversation Service（T4.5）直连调用 Agent Runner 的流式执行接口。本地单进程调试时指向
+    # localhost（与 agent-runner 本地起服务用的 AGENT_RUNNER_HTTP_PORT 一致）；容器内由
+    # docker-compose.yml 覆盖成 compose 服务名（TECH_DESIGN：DNS 轮询直连任意副本，不需要注册表）
+    agent_runner_host: str = "localhost"
+    agent_runner_http_port: int = 8100
+    # 单次对话执行没有固定时长上限（模型可能连续多轮工具调用），只在建立连接阶段设超时，
+    # 建立后交给 SSE 流本身的生命周期控制，不对整个流式响应设总超时
+    agent_runner_connect_timeout_seconds: float = 10.0
+
+    @property
+    def agent_runner_base_url(self) -> str:
+        return f"http://{self.agent_runner_host}:{self.agent_runner_http_port}"
+
     @property
     def minio_endpoint(self) -> str:
         return f"{self.minio_host}:{self.minio_port}"
